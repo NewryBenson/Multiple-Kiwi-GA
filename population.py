@@ -53,6 +53,7 @@ class Template:
         return round(randparam, int(rounding))
 
     def initial_vinf(self, teff, a, b):
+        """calculates the initial vinf based on the method in Hawcroft C. 2023"""
         if 'vinf' in self.variables.keys(): #start with estimated value. Deviate from there
             start, stop, step, rounding = self.variables['vinf']
             start, stop, step, rounding = float(start), float(stop), float(step), int(rounding)

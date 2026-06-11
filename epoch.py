@@ -27,6 +27,11 @@ class Epoch:
         return list(self.lines.keys())
 
     def get_residuals(self, vrads, individuals_per_line):
+        '''
+        calculates the residuals between a model and the data
+        :param vrads: The list of radial velocities
+        :param individuals_per_line: A list containing the broadened fastwind outputs of all components for all lines
+        '''
         c = 299792.458  # km/s
         residuals = []
 
@@ -65,6 +70,9 @@ class Epoch:
         return np.concatenate(residuals)
 
     def get_active_lines(self):
+        '''
+        Returns the names of the linewindows that have a nonzero overlap with the data in this epoch
+        '''
         result = []
         for name in self.lines.keys():
             if len(self.lines[name][0]) > 0:

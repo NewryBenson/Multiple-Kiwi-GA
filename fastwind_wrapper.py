@@ -361,6 +361,7 @@ def gen_modnames(gen: int, size: int, multiplicity: int, zfillen=4):
     return np.array(modnames)
 
 def init_comp_dir(inidir, therundir, name):
+    """Creates the directory a component will run in, and copies the fastwind code there"""
     moddir = therundir + name + '/'
     mkdir(moddir)
     modinicalc = moddir + 'inicalc/'
@@ -937,6 +938,7 @@ def read_fluxcont(fw_run_out, rstar, rmax_fw):
 
 
 def run_diagnostic_saves(comp_outdir, compinicalc, name, genes: pop.Component):
+    """Saves some diagnostic values of a run, as well as its parameters"""
     fw_run_out = compinicalc + name + '/'
     runinfo = get_runinfo(compinicalc)
     xlum = get_xlum_out(fw_run_out)
@@ -1042,7 +1044,12 @@ def save_fastwind_output(compdir, savedir, name, genes):
     shutil.rmtree(compdir)
 
 def get_fastwind_output(inicalcdir, rundir, savedir, modelatom, fw_timeout, lineinfo, fail_counter: int, precomp, verbose, loc, genes: pop.Component, timer=0.0):
-
+    """
+    The main function of the genetic algorithm. This should be run in parallel
+    It calculates the fastwind spectra of all components and saves the output
+    If the run succeeds, it returns the component it calculated
+    If the run fails, it returns None
+    """
     start_time = time.time()
     name = genes.name
 
@@ -1104,6 +1111,7 @@ def store_model(chi2file, name, gen, fitinfo):
 
 
 def shrink_savefile(comp_outdir, lineinfo):
+    """Compresses the saved spectra for more efficient storage"""
     linenames, lineres, epochs, lineweight = lineinfo
     for line in linenames:
         linefile = comp_outdir + 'profiles/' + line + '.prof.fin'
@@ -1125,7 +1133,7 @@ def shrink_savefile(comp_outdir, lineinfo):
 
 
 def cleanup_files(components, inddir, vrads, lineinfo):
-    # Compress saved dir to tar.gz file and remove the directory. Also create vrads and params.csv file in the combined dir and zip that
+    """Compress saved dir to tar.gz file and remove the directory. Also create vrads and params.csv file in the combined dir and zip that"""
     combined = inddir + 'combined/'
     tarnamecombined = inddir + 'combined.tar.gz'
     mkdir(combined)
@@ -1174,6 +1182,9 @@ def permuted_initial_guesses(x):
     return [np.array(p) for p in perms]
 
 def fit_vrads(epoch: Epoch, line_data, guesses):
+    """Calculates the best fitting radial velocities given the model output of the components and the epoch to fit them to.
+    The fit gets permutated over the components to avoid vrads swapping places
+    """
     res0 = least_squares(epoch.get_residuals, guesses, args=[line_data], method='trf', bounds=(min(guesses)-600, max(guesses)+600))
 
     best_result = res0
