@@ -272,7 +272,6 @@ def broaden_function(wave, flux, resolution, vsini, limbdark=0.6, nsig=4, vmacro
     final_profile = convolve(instrument_profile_temp, rotational_profile, mode="same")
 
     if vmacro and vmacro != -1:  # This works fine as long as non-negative scalars are being put in for vmacro
-        print("vmacro: %.3g" % vmacro)
         # Calculate the macro turbulent broadening profile
         macro_profile = macro_broading_profile(wave, vmacro)
 
@@ -379,7 +378,7 @@ if __name__ == "__main__":
 
     # Read in the spectrum
     try:
-        wlc, flux = np.genfromtxt(arguments.fileName).T
+        wlc, flux = np.loadtxt(arguments.fileName, unpack=True)
     except IOError as ioe:
         print(ioe, "Input spectrum " + arguments.fileName + " not found!")
         sys.exit()

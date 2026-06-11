@@ -1,6 +1,6 @@
 # Specify radius or luminosity anchor
 # If fixed radius type:
-# fixed_radius <radius in solar radii>
+# fixed_radius <radius 1 in solar radii> <radius 2 in solar radii> ...
 # If luminosity anchor type:
 # <bandname> <observed magnitude> <zero point system>
-2MASS_Ks -4.36 vega
+2MASS_Ks -5.32 vega

@@ -6,10 +6,10 @@ Make sure the right settings are chosen and the correct modules are imported.
 """
 
 username = "vsc36648"
-codedir = "Kiwi-GA"
+codedir = "Multiple-Kiwi-GA"
 cores_per_node = 36
-max_wall_time = "7"  # In hours, this has to be a string.
-time_per_gen = 1.1  # in hours
+max_wall_time = 10000  # In minutes
+time_per_gen = 60 # in minutes
 scratch_loc = "/scratch/leuven/366/"
 home_loc = "/data/leuven/366"
 

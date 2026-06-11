@@ -3,6 +3,8 @@
 #
 # Updated for use on Snellius by Frank Backs 18-10-2021
 #
+# Sander Van den Eynden 11-3-2026 edits: Multiple-Kiwi-GA
+#
 # Should be executed before starting a run:
 #  - Checks several aspects of the run setup
 #      * Prints report where errors are pointed out
@@ -27,11 +29,13 @@ from matplotlib.backends.backend_pdf import PdfPages
 import fastwind_wrapper as fw
 import population as pop
 import cluster_inputs as ci
+from epoch import Epoch
 
-jobscriptfile = 'run_kiwiGA.job' # name of job script file
-hours_str = ci.max_wall_time # maximum wall time -- but see below!
-walltime_flex = True # adjust maximum wall time depending on ngen
-hrs_gen = ci.time_per_gen # hours per generation if walltime_flex
+fw.mkdir('runs/')
+jobscriptfile = 'runs/run_kiwiGA.job' # name of job script file
+minutes_str = ci.max_wall_time # maximum wall time -- but see below!
+walltime_flex = False # adjust maximum wall time depending on ngen
+mnts_gen = ci.time_per_gen # minutes per generation if walltime_flex
 n_cpu_core = ci.cores_per_node  # number of CPUs per node
 username = ci.username
 codedir = ci.codedir  # 'Kiwi-GA'
@@ -56,14 +60,24 @@ if len(sys.argv) > 2:
 else:
     do_restart='no'
 
+
 inputmain = 'input/'
 inputdir = inputmain + run_name + '/'
+componentdir = inputdir + 'components/'
+epochdir = inputdir + 'epochs/'
 controlname = inputdir + 'control.txt'
-paramspacename = inputdir + 'parameter_space.txt'
+paramspacecomponentfiles = os.listdir(componentdir)
+paramspacecomponentfiles.sort()
 radinfoname = inputdir + 'radius_info.txt'
 linesetname = inputdir + 'line_list.txt'
 defaultsname = inputdir + 'defaults_fastwind.txt'
-spectrumname = inputdir + 'spectrum.norm'
+epochfiles = os.listdir(epochdir)
+epochfiles.sort()
+
+paramspace_in = [componentdir + component for component in paramspacecomponentfiles]
+epoch_in = [epochdir + epoch for epoch in epochfiles]
+
+multiplicity = len(paramspace_in)
 
 param_fig = inputdir + 'parameter_input.pdf'
 spectrum_fig = inputdir + 'spectrum_input.pdf'
@@ -117,10 +131,12 @@ if ncol_linedata != ncol_line_needed:
 
 # Read in files
 ctrldct = fw.read_control_pars(controlname)
-lineinfo = fw.read_data(linesetname, spectrumname)
-the_paramspace = fw.read_paramspace(paramspacename)
-param_names, param_space, fixed_names, fixed_pars = the_paramspace
-defnames, defvals = fw.get_defvals(defaultsname, param_names, fixed_names)
+lineinfo = fw.read_data(linesetname, epoch_in)
+
+# Read input files and data
+paramspaces: list[pop.Template] = []
+for component in paramspace_in:
+    paramspaces.append(pop.Template(component, defaultsname))
 
 # Test if inicalc as specified in control.txt is present
 test_inidir = ctrldct['inicalcdir']
@@ -134,8 +150,10 @@ if test_inidir not in next(os.walk('.'))[1]:
         "' not found. Aborting pre_run_check.")
     sys.exit()
 
+nfree = sum([len(comp.variables.keys()) for comp in paramspaces])
+
 # Check n_ind
-if (ctrldct["nind"]+1)/n_cpu_core % 1.0  > 0.0:
+if (ctrldct["nind"]*multiplicity+1)/n_cpu_core % 1.0  > 0.0:
     print("WARNING!! not using all " + str(n_cpu_core) + " cpu's per" 
         " core")
     input('Press enter to ignore...')
@@ -144,7 +162,7 @@ print("\nnind = " + str(ctrldct["nind"]))
 print("ngen = " + str(ctrldct["ngen"]))
 
 if walltime_flex:
-    hours_str = str(int(math.ceil(float(ctrldct["ngen"])*hrs_gen)))
+    minutes_str = str(int(math.ceil(float(ctrldct["ngen"])*mnts_gen)))
 
 printsection("FW version")
 # Check version 10 vs 11
@@ -258,9 +276,10 @@ if ctrldct["use_string"] in ('yes', 'y', 'True', True):
         print('WARNING: fracdouble_string should have a value 0 <= value <= 1.0, ' 
             '\n current value is ' + str(ctrldct["fracdouble_string"]))
 
-if not abs(float(ctrldct["mut_rate_max"]) - 2./len(param_names)) < 0.001:
+
+if not abs(float(ctrldct["mut_rate_max"]) - 2./nfree) < 0.001:
     print("2/nfree =! mut_rate_max")
-    print("   - 2/nfree      = "+ str(round(2./len(param_names),3)))
+    print("   - 2/nfree      = "+ str(round(2./nfree,3)))
     print("   - mut_rate_max = " + str(ctrldct["mut_rate_max"]))
     checkdict["Mutation"] = False
 
@@ -287,82 +306,6 @@ if mut_adj_type == 'autocharb':
     print('ac_lowerlim     ' + ac_lowerlim)
     print('ac_upperlim     ' + ac_upperlim)
 
-# Checks on parameter space
-all_names = np.concatenate((np.concatenate((param_names,fixed_names)),defnames))
-nonfree_names = np.concatenate((fixed_names,defnames))
-nonfree_vals = np.concatenate((fixed_pars,defvals))
-allp_dict = dict(zip(nonfree_names, nonfree_vals))
-
-# Check if all elements are in defaults
-# If an addional parameter is needed in an update of the GA, then
-# add it to this list to ensure a run does not crash if you copy 
-# an old defaults_fastwind.txt file
-fastwind_def_complete = ['C',
-                         'N',
-                         'O',
-                         'Si',
-                         'Mg',
-                         'P',
-                         'Fe',
-                         'S',
-                         'Na',
-                         'Ca',
-                         'optne_update',
-                         'he_one',
-                         'it_start',
-                         'itmore',
-                         'optmixed',
-                         'rmax',
-                         'tmin',
-                         'vmin_start',
-                         'beta',
-                         'vdiv',
-                         'ihe_start',
-                         'optmod',
-                         'opttlucy',
-                         'megas',
-                         'accel',
-                         'optcmf',
-                         'micro',
-                         'metallicity',
-                         'lines',
-                         'lines_in_model',
-                         'enat_cor',
-                         'expansion',
-                         'set_first',
-                         'set_step',
-                         'fclump',
-                         'logfclump',
-                         'vclstart', 
-                         'vclmax', 
-                         'vcl',
-                         'vcldummy',
-                         'opthopf', 
-                         'do_iescat',
-                         'vclmax', 
-                         'opthopf', 
-                         'do_iescat',
-                         'opthopf',
-                         'do_iescat',
-                         'do_iescat',
-                         'windturb',
-                         'fic',
-                         'hclump',
-                         'fx',
-                         'uinfx',
-                         'mx',
-                         'gamx',
-                         'Rinx',
-                         'logfx',
-                         'xpow']
-
-for a_def_par in fastwind_def_complete:
-    #if not ((a_def_par in defnames) or (a_def_par in param_names)):
-    if not a_def_par in all_names:
-        print("\n\n   ERROR: '" + a_def_par + "' neither in defaults_" +
-              "fastwind.txt nor in parameter_space.txt\n\n")
-        sys.exit()
-
 printsection('Line list')
 # Checks on line_list.txt
 checkdict["Line list"] = True
@@ -376,14 +319,14 @@ for ii in range(len(lineinfo[0])):
     normr0 = ll_check[8][ii]
     rvcorr0 = ll_check[4][ii]
     if norml0 != 0.0 or normr0 != 0.0:
-        print("WARNING: normalisation correction used for line " + lname0 + 
-            ".\n    This should work in principle, but is not extensively " +
-            "tested.\n    Please carefully check the output of this run.")
+        print("WARNING: normalisation correction used for line " + lname0 +
+              ".\n    This should work in principle, but is not extensively " +
+              "tested.\n    Please carefully check the output of this run.")
         checkdict["Line list"] = False
     if rvcorr0 != 0.0:
-        print("WARNING: radial velocity correction used for line " + lname0 + 
-            ".\n    This should work in principle, but is not extensively " +
-            "tested.\n    Please carefully check the output of this run.")
+        print("WARNING: radial velocity correction used for line " + lname0 +
+              ".\n    This should work in principle, but is not extensively " +
+              "tested.\n    Please carefully check the output of this run.")
         checkdict["Line list"] = False
     if lname0.startswith('UV_'):
         if not uvres0 > 0:
@@ -392,309 +335,363 @@ for ii in range(len(lineinfo[0])):
             sys.exit()
         elif uvres0 < 0.05:
             print('WARNING: Line ' + lname0 + ' will be computed with a step ' +
-                'size of ' + str(uvres0) + '\n   Computation may be slow. ')
-            checkdict["Line list"] = False 
+                  'size of ' + str(uvres0) + '\n   Computation may be slow. ')
+            checkdict["Line list"] = False
         elif uvres0 > 1.0:
             print('WARNING: Line ' + lname0 + ' will be computed with a step ' +
-                'size of ' + str(uvres0) + '\n   Is this small enough? ')
-            checkdict["Line list"] = False 
+                  'size of ' + str(uvres0) + '\n   Is this small enough? ')
+            checkdict["Line list"] = False
         nameL = float(lname0.split('_')[1])
         nameR = float(lname0.split('_')[2])
-        if (nameL-uvlb0 < -larger_wavemax or uvrb0-nameR < -larger_wavemax):
+        if (nameL - uvlb0 < -larger_wavemax or uvrb0 - nameR < -larger_wavemax):
             print("WARNING: wavelength range specified do not correspond " +
-                "to name of CMF line: \n    " + lname0 + 
-                " (lbound=" + str(uvlb0) + ", rbound=" + str(uvrb0) +")" + 
-                "\n    Model region much larger than fitting region!")
+                  "to name of CMF line: \n    " + lname0 +
+                  " (lbound=" + str(uvlb0) + ", rbound=" + str(uvrb0) + ")" +
+                  "\n    Model region much larger than fitting region!")
             checkdict["Line list"] = False
-        if (uvlb0-nameL < 0.0 or nameR-uvrb0 < 0.0):
+        if (uvlb0 - nameL < 0.0 or nameR - uvrb0 < 0.0):
             print("ERROR: wavelength range specified do not correspond " +
-                "to name of CMF line: \n    " + lname0 + 
-                " (lbound=" + str(uvlb0) + ", rbound=" + str(uvrb0) +")" +
-                "\n    Model region does not cover fitting region!")
+                  "to name of CMF line: \n    " + lname0 +
+                  " (lbound=" + str(uvlb0) + ", rbound=" + str(uvrb0) + ")" +
+                  "\n    Model region does not cover fitting region!")
             checkdict["Line list"] = False
     elif not uvres0 == 0:
-            print('ERROR for line_list.txt, line: ' + lname0) 
-            print('Column 11 of line_list.txt should equal 0.0 for ' +
-                ' a non CMF line.')
-            checkdict["Line list"] = False
+        print('ERROR for line_list.txt, line: ' + lname0)
+        print('Column 11 of line_list.txt should equal 0.0 for ' +
+              ' a non CMF line.')
+        checkdict["Line list"] = False
     if lineweight != 1.0 and ctrldct["fitmeasure"] == 'chi2':
         print("WARNING! Line weight of " + lname0 + " != 1.0, but " +
-            "fitmeasure is chi2. \n     Lineweight has no effect: " +
-            " \n      choose fitness as fitmeasure or set all weights to 1.0")
+              "fitmeasure is chi2. \n     Lineweight has no effect: " +
+              " \n      choose fitness as fitmeasure or set all weights to 1.0")
         checkdict["Line list"] = False
-        
+
 if checkdict["Line list"]:
     print("Line list seems ok, but please check also the plot")
 
-printsection('Parameter space')
-print('Number of free parameters: ' + str(len(param_names)))
-for pn in param_names:
-    print('   - ' + pn)
+# Checks on parameter space
+printsection('Parameter spaces')
+print('Number of free parameters: ' + str(nfree))
 checkdict["Parameter space"] = True
-print('\nFixed values read in from parameter space file: ')
-for fp, fv in zip(fixed_names, fixed_pars):
-    print('   - ' + fp + ': ' + str(fv))
 
-with open(paramspacename) as f:
-    plines = f.readlines()
-
-if 'vinf' in param_names:
-    for iii in range(len(param_names)):
-        if param_names[iii] == 'vinf':
-            vinfidx = iii
-    if float(param_space[vinfidx][0]) == 0.0:
-        checkdict["Parameter space"] = False
-        print("ERROR: vinf cannot be 0.0!")
-    if float(param_space[vinfidx][1]) == 0.0:
-        checkdict["Parameter space"] = False
-        print("ERROR: vinf cannot be 0.0!")
-
-if 'vturb' in param_names or 'vturb' in fixed_names or 'vturb' in defnames:
+if multiplicity > 2:
+    print("WARNING: multiplicity is " + str(multiplicity) +
+          ".\n    This should work in principle, but is not extensively " +
+          "tested.\n    Please carefully check the output of this run.")
     checkdict["Parameter space"] = False
-    print("ERROR: 'vturb' is not a parameter, use instead: \n  'micro' (for " +
-        "micro turbulence), 'macro' (for macro turbulence) or \n  'windturb'" +
-        " (for wind turbulence)")
 
-print('')
-if 'fclump' in param_names and 'logfclump' in param_names:
-    checkdict["Parameter space"] = False 
-    print("ERROR: both fclump and logfclump are free parameters!")
-elif 'fclump' in param_names:
-    if float(allp_dict['logfclump']) < np.log10(1000.0):
-        checkdict["Parameter space"] = False
-        print("ERROR: fclump free, but logfclump set to < 3.0")
-    else:
-        print("Using 'fclump' as free clumping parameter")
-elif 'logfclump' in param_names:
-    print("Using 'logfclump' as free clumping parameter")
-    for thepname, i in zip(param_names, range(len(param_space))):
-        if thepname == 'logfclump':
-            if float(param_space[i][1]) > 2.0:
-                checkdict["Parameter space"] = False
-                print("logfclump (upper) = " + str(param_space[i][1]) + "!")
-                print("ERROR: fclump upper limit is very high!") 
-            if float(param_space[i][0]) < 0.0:
-                checkdict["Parameter space"] = False
-                print("logfclump (lower) = " + str(param_space[i][0]) + "!")
-                print("ERROR: fclump should never be lower than 1.0!")
-else:
-    print('No clumping fitted')
-    if 'logfclump' not in all_names:
-        print('ERROR: add "logfclump" to defaults_fastwind.txt !!')
-        checkdict["Parameter space"] = False
 
-printsection("X-rays")
+for paramspace in paramspaces:
+    printsection('Next parameter space')
+    for pn in paramspace.variables.keys():
+        print('   - ' + pn)
 
-if not ('fx' in all_names and 'logfx' in all_names):
-    checkdict["Parameter space"] = False 
-    print("ERROR! X-rays not specified.")
-    if not 'fx' in all_names:
-        print("  --> fx missing")
-    else: 
-        print("  --> logfx missing")
-    print("Add to params or defaults file")
-else:
-    need_xraydetails = False
-    if 'fx' in param_names:
-        need_xraydetails = True
-        print("X-rays included")
-        print("   - fx is a free parameter")
-        if ('logfx' not in param_names and 
-                float(allp_dict['logfx']) < np.log10(16.0)):
-            checkdict["Parameter space"] = False
-            print("ERROR --> logfx set to < 1.2 but not in use")
-    if 'logfx' in param_names:
-        need_xraydetails = True
-        print("X-rays included")
-        print("   - logfx is a free parameter")
-        if 'fx' not in param_names and float(allp_dict['fx']) > 0:
-            checkdict["Parameter space"] = False
-            print("ERROR --> fx set to > 0 but not in use")
-    elif 'logfx' in fixed_names:
-        print("'logfx' should not be fixed in param_space")
-        print("   if you want to fix fx, please use 'fx' for this!")
-        checkdict["Parameter space"] = False
-    elif (float(allp_dict['fx']) > 0.0) or (float(allp_dict['fx']) < -1000):
-        need_xraydetails = True
-        print("X-rays included")
-        if float(allp_dict['fx']) > 1000:
-            print("   - Estimating fx with Kudritzki 1996 law")
-            if float(allp_dict['xpow']) > -1000:
-                print("   - Kudritzki estimate cannot be used with the Puls+20")
-                print("     prescription of X-rays!")
-                checkdict["Parameter space"] = False
-        if float(allp_dict['fx']) < -1000:
-            print("   - Estimating fx with theoretical law")
-            if float(allp_dict['xpow']) > -1000:
-                print("   - Kudritzki estimate cannot be used with the Puls+20")
-                print("     prescription of X-rays!")
-                checkdict["Parameter space"] = False
-        else:
-            print("   - fx is fixed at " + allp_dict['fx'])
-    if need_xraydetails:   
-        if ctrldct["inicalcdir"].startswith('v11'):
-            print("ERROR: X-rays not yet included in GA for CMF version 11.")
-            print("Please set fx to -1 and logfx to > 1.3 or change to v10.")
-            print("Exiting.")
+    all_names = np.concatenate((list(paramspace.variables.keys()), list(paramspace.fixed.keys())))
+    free_names = paramspace.variables.keys()
+    nonfree_names = paramspace.fixed.keys()
+    nonfree_vals = paramspace.fixed.values()
+    free_dict = paramspace.variables
+    fixed_dict = paramspace.fixed
+
+    # Check if all elements are in defaults
+    # If an addional parameter is needed in an update of the GA, then
+    # add it to this list to ensure a run does not crash if you copy
+    # an old defaults_fastwind.txt file
+    fastwind_def_complete = ['C',
+                             'N',
+                             'O',
+                             'Si',
+                             'Mg',
+                             'P',
+                             'Fe',
+                             'S',
+                             'Na',
+                             'Ca',
+                             'optne_update',
+                             'he_one',
+                             'it_start',
+                             'itmore',
+                             'optmixed',
+                             'rmax',
+                             'tmin',
+                             'vmin_start',
+                             'beta',
+                             'vdiv',
+                             'ihe_start',
+                             'optmod',
+                             'opttlucy',
+                             'megas',
+                             'accel',
+                             'optcmf',
+                             'micro',
+                             'metallicity',
+                             'lines',
+                             'lines_in_model',
+                             'enat_cor',
+                             'expansion',
+                             'set_first',
+                             'set_step',
+                             'fclump',
+                             'logfclump',
+                             'vclstart',
+                             'vclmax',
+                             'vcl',
+                             'vcldummy',
+                             'opthopf',
+                             'do_iescat',
+                             'vclmax',
+                             'opthopf',
+                             'do_iescat',
+                             'opthopf',
+                             'do_iescat',
+                             'do_iescat',
+                             'windturb',
+                             'fic',
+                             'hclump',
+                             'fx',
+                             'uinfx',
+                             'mx',
+                             'gamx',
+                             'Rinx',
+                             'logfx',
+                             'xpow',
+                             'ratio']
+
+    for a_def_par in fastwind_def_complete:
+        #if not ((a_def_par in defnames) or (a_def_par in param_names)):
+        if not a_def_par in all_names:
+            print("\n\n   ERROR: '" + a_def_par + "' neither in defaults_" +
+                  "fastwind.txt nor in parameter_space.txt\n\n")
             sys.exit()
-        if 'teff' not in param_names:
-            if float(allp_dict['teff']) < 25000.0:
-                print("ERROR: X-rays included but Teff fixed to < 25000")
-                checkdict["Parameter space"] = False
-        else:
-            for iii in range(len(param_names)):
-                if param_names[iii] == 'teff':
-                    teffidx = iii
-            if float(param_space[teffidx][1]) < 25000.0:
-                print("ERROR: X-rays included but full parameter space \n"+
-                      "will be treated without X-rays: all Teff < 25000")
-                checkdict["Parameter space"] = False
-            elif float(param_space[teffidx][0]) < 25000.0:
-                print("\n\nWARNING: X-rays included but part of parameter "+
-                      "space will be treated\nwithout X-rays: Teff range "+
-                      "covers Teff < 25000\n\n")
-        if not ('gamx' in all_names and 'Rinx' in all_names and 'mx' in all_names 
-            and 'uinfx' in all_names):
+
+    print('\nFixed values read in from parameter space file: ')
+    for key, value in paramspace.fixed.items():
+        print('   - ' + key + ': ' + str(value))
+
+    if 'vinf' in free_names:
+        if float(free_dict['vinf'][0]) == 0.0:
             checkdict["Parameter space"] = False
-            print("ERROR: One or more X-ray parameters are missing")
+            print("ERROR: vinf cannot be 0.0!")
+        if float(free_dict['vinf'][1]) == 0.0:
+            checkdict["Parameter space"] = False
+            print("ERROR: vinf cannot be 0.0!")
+
+    if 'vturb' in all_names:
+        checkdict["Parameter space"] = False
+        print("ERROR: 'vturb' is not a parameter, use instead: \n  'micro' (for " +
+            "micro turbulence), 'macro' (for macro turbulence) or \n  'windturb'" +
+            " (for wind turbulence)")
+
+    print('')
+    if 'fclump' in free_names and 'logfclump' in free_names:
+        checkdict["Parameter space"] = False
+        print("ERROR: both fclump and logfclump are free parameters!")
+    elif 'fclump' in free_names:
+        if float(fixed_dict['logfclump']) < np.log10(1000.0):
+            checkdict["Parameter space"] = False
+            print("ERROR: fclump free, but logfclump set to < 3.0")
         else:
-            print("Other parameters:")
-            for apar in ('uinfx', 'mx', 'gamx', 'Rinx'):
-                if apar in param_names:
-                    print("   - " + apar + " is a free parameter")
-                else:
-                    print("   - " + apar + " = " + allp_dict[apar])
+            print("Using 'fclump' as free clumping parameter")
+    elif 'logfclump' in free_names:
+        print("Using 'logfclump' as free clumping parameter")
+        if float(free_dict['logfclump'][1]) > 2.0:
+            checkdict["Parameter space"] = False
+            print("logfclump (upper) = " + str(free_dict['logfclump'][1]) + "!")
+            print("ERROR: fclump upper limit is very high!")
+        if float(free_dict['logfclump'][0]) < 0.0:
+            checkdict["Parameter space"] = False
+            print("logfclump (lower) = " + str(free_dict['logfclump'][0]) + "!")
+            print("ERROR: fclump should never be lower than 1.0!")
     else:
-        print("X-rays not included")
-        for apar in ('uinfx', 'mx', 'gamx', 'Rinx'):
-            if apar in param_names:
+        print('No clumping fitted')
+        if 'logfclump' not in all_names:
+            print('ERROR: add "logfclump" to defaults_fastwind.txt !!')
+            checkdict["Parameter space"] = False
+
+    printsection("X-rays")
+
+    if not ('fx' in all_names and 'logfx' in all_names):
+        checkdict["Parameter space"] = False
+        print("ERROR! X-rays not specified.")
+        if not 'fx' in all_names:
+            print("  --> fx missing")
+        else:
+            print("  --> logfx missing")
+        print("Add to params or defaults file")
+    else:
+        need_xraydetails = False
+        if 'fx' in free_names:
+            need_xraydetails = True
+            print("X-rays included")
+            print("   - fx is a free parameter")
+            if 'logfx' not in free_names and float(fixed_dict['logfx']) < np.log10(16.0):
                 checkdict["Parameter space"] = False
-                print("ERROR: " + apar + " is a free parameteter but " + 
-                    "fx is 0.0!") 
-    if 'fx' in param_names and 'logfx' in param_names:
-        checkdict["Parameter space"] = False
-        print("ERROR: both fx and logfx are free parameters")
-    elif 'fx' in param_names and allp_dict['logfx'] <= np.log(16.0):
-        checkdict["Parameter space"] = False
-        print("ERROR: fx is a free parameter, but logfx is in use")
-        print("   value of logfx = " + str(allp_dict['logfx']))
-    elif 'logfx' in param_names and float(allp_dict['fx']) > 1000.0:
-        checkdict["Parameter space"] = False
-        print("ERROR: logfx is a free parameter, but fx is set to be chosen ")
-        print("       according to the Kudritzki law (fx > 1000).")
-    elif 'logfx' in param_names:
-        for thepname, i in zip(param_names, range(len(param_space))):
-            if thepname == 'logfx':
-                if float(param_space[i][1]) >= np.log10(16.0):
+                print("ERROR --> logfx set to < 1.2 but not in use")
+        if 'logfx' in free_names:
+            need_xraydetails = True
+            print("X-rays included")
+            print("   - logfx is a free parameter")
+            if 'fx' not in free_names and float(fixed_dict['fx']) > 0:
+                checkdict["Parameter space"] = False
+                print("ERROR --> fx set to > 0 but not in use")
+        elif (float(fixed_dict['fx']) > 0.0) or (float(fixed_dict['fx']) < -1000):
+            need_xraydetails = True
+            print("X-rays included")
+            if float(fixed_dict['fx']) > 1000:
+                print("   - Estimating fx with Kudritzki 1996 law")
+                if float(fixed_dict['xpow']) > -1000:
+                    print("   - Kudritzki estimate cannot be used with the Puls+20")
+                    print("     prescription of X-rays!")
                     checkdict["Parameter space"] = False
-                    print("ERROR: please set logfx upperbound no larger than 1.2")
+            if float(fixed_dict['fx']) < -1000:
+                print("   - Estimating fx with theoretical law")
+                if float(fixed_dict['xpow']) > -1000:
+                    print("   - Kudritzki estimate cannot be used with the Puls+20")
+                    print("     prescription of X-rays!")
+                    checkdict["Parameter space"] = False
+            else:
+                print("   - fx is fixed at " + fixed_dict['fx'])
+        if need_xraydetails:
+            if ctrldct["inicalcdir"].startswith('v11'):
+                print("ERROR: X-rays not yet included in GA for CMF version 11.")
+                print("Please set fx to -1 and logfx to > 1.3 or change to v10.")
+                print("Exiting.")
+                sys.exit()
+            if 'teff' not in free_names:
+                if float(fixed_dict['teff']) < 25000.0:
+                    print("ERROR: X-rays included but Teff fixed to < 25000")
+                    checkdict["Parameter space"] = False
+            else:
+                if float(free_dict['teff'][1]) < 25000.0:
+                    print("ERROR: X-rays included but full parameter space \n"+
+                          "will be treated without X-rays: all Teff < 25000")
+                    checkdict["Parameter space"] = False
+                elif float(free_dict['teff'][0]) < 25000.0:
+                    print("\n\nWARNING: X-rays included but part of parameter "+
+                          "space will be treated\nwithout X-rays: Teff range "+
+                          "covers Teff < 25000\n\n")
+            if not ('gamx' in all_names and 'Rinx' in all_names and 'mx' in all_names
+                and 'uinfx' in all_names):
+                checkdict["Parameter space"] = False
+                print("ERROR: One or more X-ray parameters are missing")
+            else:
+                print("Other parameters:")
+                for apar in ('uinfx', 'mx', 'gamx', 'Rinx'):
+                    if apar in free_names:
+                        print("   - " + apar + " is a free parameter")
+                    else:
+                        print("   - " + apar + " = " + fixed_dict[apar])
+        else:
+            print("X-rays not included")
+            for apar in ('uinfx', 'mx', 'gamx', 'Rinx'):
+                if apar in free_names:
+                    checkdict["Parameter space"] = False
+                    print("ERROR: " + apar + " is a free parameteter but " +
+                        "fx is 0.0!")
+        if 'fx' in free_names and 'logfx' in free_names:
+            checkdict["Parameter space"] = False
+            print("ERROR: both fx and logfx are free parameters")
+        elif 'fx' in free_names and fixed_dict['logfx'] <= np.log(16.0):
+            checkdict["Parameter space"] = False
+            print("ERROR: fx is a free parameter, but logfx is in use")
+            print("   value of logfx = " + str(fixed_dict['logfx']))
+        elif 'logfx' in free_names and float(fixed_dict['fx']) > 1000.0:
+            checkdict["Parameter space"] = False
+            print("ERROR: logfx is a free parameter, but fx is set to be chosen ")
+            print("       according to the Kudritzki law (fx > 1000).")
+        elif 'logfx' in free_names:
+            if float(free_dict['logfx'][1]) >= np.log10(16.0):
+                checkdict["Parameter space"] = False
+                print("ERROR: please set logfx upperbound no larger than 1.2")
 
-p_line_names = []
-for aline in plines:
-    if not aline.startswith('#'):
-        p_line_names.append(aline.split()[0])
-if len(p_line_names) != len(np.unique(p_line_names)):
-    print('ERROR: duplicates found in parameter space')
-    pduplicates = []
-    for ap1 in range(len(p_line_names)):
-        for ap2 in range(len(p_line_names)):
-            if ap1 != ap2 and p_line_names[ap1] == p_line_names[ap2]:
-                pduplicates.append(p_line_names[ap1])
-    print('Duplicate parameters: ')
-    for dup in np.unique(pduplicates):
-        print('  - ' + dup)
-    checkdict["Parameter space"] = False
-if 'fic' not in param_names:
-    if 'fic' in fixed_names:
-        for i in range(len(fixed_names)):
-            if fixed_names[i] == 'fic':
-                if fixed_pars[i] == -1:
-                    tparams = ''
-                    tlen = 0
-                    print('WARNING! fic in defaults set to -1')
-                    print('This means a fixed value of 10^-1 = 0.1 is used')
-                    print('If you intent to use optically thin clumping,')
-                    print('Set this value to 999 and rerun this script')
-                    input('If you intent to fix fic to 0.01, press enter')
-                else:
-                    tparams = ''
-                    tlen = -10
-    else:
-        tparams = ''
-        tlen = 0
-    for aparam in param_names:
-        #if aparam in ('vclstart', 'vclmax', 'fvel', 'h'):
-        if aparam in ('fvel', 'h'):
-            tparams = tparams + '"' + aparam + '" ' 
-            tlen = tlen + 1
-    if tlen == 1:
-        tparams = tparams + 'is'
-    else:
-        tparams = tparams + 'are'
-    if tlen > 0:
-        print('ERROR: no thick clumping, but ' + tparams + ' varied!')
+
+    if 'fic' not in free_names:
+        if 'fic' in nonfree_names:
+            if fixed_dict['fic'] == -1:
+                tparams = ''
+                tlen = 0
+                print('WARNING! fic in defaults set to -1')
+                print('This means a fixed value of 10^-1 = 0.1 is used')
+                print('If you intent to use optically thin clumping,')
+                print('Set this value to 999 and rerun this script')
+                input('If you intent to fix fic to 0.01, press enter')
+            else:
+                tparams = ''
+                tlen = -10
+        else:
+            tparams = ''
+            tlen = 0
+        for aparam in free_names:
+            #if aparam in ('vclstart', 'vclmax', 'fvel', 'h'):
+            if aparam in ('fvel', 'h'):
+                tparams = tparams + '"' + aparam + '" '
+                tlen = tlen + 1
+        if tlen == 1:
+            tparams = tparams + 'is'
+        else:
+            tparams = tparams + 'are'
+        if tlen > 0:
+            print('ERROR: no thick clumping, but ' + tparams + ' varied!')
+            checkdict["Parameter space"] = False
+    if 'vcl' in free_names and ('vclstart' in  free_names or 'vclmax' in free_names):
+        print('ERROR: vclstart and vcl cannot be fitted simultaneously')
+        print('       vcl > 0: use linear step function clumping law')
+        print('                vclstart not used')
+        print('       vcl > -1: use linear step function clumping law')
+        print('                vcl not used')
         checkdict["Parameter space"] = False
-if 'vcl' in param_names and ('vclstart' in  param_names or 'vclmax' in param_names):
-    print('ERROR: vclstart and vcl cannot be fitted simultaneously')
-    print('       vcl > 0: use linear step function clumping law')
-    print('                vclstart not used')
-    print('       vcl > -1: use linear step function clumping law')
-    print('                vcl not used')
-    checkdict["Parameter space"] = False 
 
-if ctrldct["inicalcdir"].startswith("v11"):
-    if 'fic' in param_names:
-        print("ERROR: optically thick clumping not in CMF version 11!")
-        print("Exiting")
-        sys.exit()
-    elif 'fic' in fixed_names:
-        for i in range(len(fixed_names)):
-            if fixed_names[i] == 'fic':
-                 if fixed_pars[i] != -1:
-                     print("ERROR: optically thick clumping not in CMF" +
-                          " version 11! fic != -1. Exiting.")
-                     sys.exit() 
-        
-if checkdict["Parameter space"] == True:
-    print('\nParameter space ok.')
+    if ctrldct["inicalcdir"].startswith("v11"):
+        if 'fic' in free_names:
+            print("ERROR: optically thick clumping not in CMF version 11!")
+            print("Exiting")
+            sys.exit()
+        elif 'fic' in free_names:
+             if fixed_dict['fic'] != -1:
+                 print("ERROR: optically thick clumping not in CMF" +
+                      " version 11! fic != -1. Exiting.")
+                 sys.exit()
 
-# Check stepsizes in parameter space
-warning_na = 3.0
-printsection('Step sizes')
-checkdict['Step size'] = True
-for i in range(len(param_space)):
-    stepsize = param_space[i][2]
-    if stepsize > 0.0:
-        pwidth = np.abs(param_space[i][1] - param_space[i][0])
-        if np.abs(pwidth/stepsize - np.round(pwidth/stepsize,0)) > 0.0001:
-            print('   - ' + param_names[i] + ': ERROR: step size cannot divide'
-                ' parameter range into equal parts')
-            print('     start: ' + str(param_space[i][0]) + ', stop: ' + 
-                 str(param_space[i][1]) + ', step: ',  str(param_space[i][2]) )
-            print(np.abs(pwidth/stepsize))
-            print(int(pwidth/stepsize))
-            checkdict['Step size'] = False
-        stepfrac = 1.0*stepsize/pwidth
-        if stepsize < 0:
-            checkdict['Step size'] = False
-            print('  - ' + param_names[i] + ': ERROR: negative stepsize')
-        if stepsize == 0.0:
-            checkdict['Step size'] = False
-            print('  - ' + param_names[i] + ': ERROR: stepsize = 0.0')
-        if stepfrac*warning_na > w_gauss_na and type_na == 'frac':
-            print('  - ' + param_names[i] + ': WARNING: stepsize is large ' +
-                'compared to narrow mutation width')
-            print('    ' + 'ratio is ' + str(round(w_gauss_na/stepfrac,2)) +
-                 ' while it is preferrably ~>' + str(warning_na) +
-                 '\n    Current step size: ' + str(stepsize) + 
-                 '\n    --> consider to decrease step size or increase w_gauss_na')
-            checkdict['Step size'] = False
-    else:    
-        print("ERROR: stepsize must exceed 0.0")
-        checkdict['Step size'] = False
+    if checkdict["Parameter space"]:
+        print('\nParameter space ok.')
 
-if checkdict['Step size'] == True:
-    print('All stepsizes ok.')
+    # Check stepsizes in parameter space
+    warning_na = 3.0
+    printsection('Step sizes')
+    checkdict['Step size'] = True
+    for par in free_names:
+        stepsize = float(free_dict[par][2])
+        if stepsize > 0.0:
+            pwidth = np.abs(float(free_dict[par][1]) - float(free_dict[par][0]))
+            if np.abs(pwidth/stepsize - np.round(pwidth/stepsize,0)) > 0.0001:
+                print('   - ' + par + ': ERROR: step size cannot divide'
+                    ' parameter range into equal parts')
+                print('     start: ' + str(free_dict[par][0]) + ', stop: ' +
+                     str(free_dict[par][1]) + ', step: ',  str(free_dict[par][2]) )
+                print(np.abs(pwidth/stepsize))
+                print(int(pwidth/stepsize))
+                checkdict['Step size'] = False
+            stepfrac = 1.0*stepsize/pwidth
+            if stepsize < 0:
+                checkdict['Step size'] = False
+                print('  - ' + par + ': ERROR: negative stepsize')
+            if stepsize == 0.0:
+                checkdict['Step size'] = False
+                print('  - ' + par + ': ERROR: stepsize = 0.0')
+            if stepfrac*warning_na > w_gauss_na and type_na == 'frac':
+                print('  - ' + par + ': WARNING: stepsize is large ' +
+                    'compared to narrow mutation width')
+                print('    ' + 'ratio is ' + str(round(w_gauss_na/stepfrac,2)) +
+                     ' while it is preferrably ~>' + str(warning_na) +
+                     '\n    Current step size: ' + str(stepsize) +
+                     '\n    --> consider to decrease step size or increase w_gauss_na')
+                checkdict['Step size'] = False
+        else:
+            print("ERROR: stepsize must exceed 0.0")
+            checkdict['Step size'] = False
+
+    if checkdict['Step size'] == True:
+        print('All stepsizes ok.')
 
 # Check wheter all lines in the line list are present in the 
 # FORMAL_INPUT master file 
@@ -745,233 +742,254 @@ if not checkdict['Step size']:
 #        Plot param space         #
 ###################################
 print('\nMaking plots...')
-ncols = 3
-nrows =int(math.ceil(1.0*len(param_space)/ncols))
-nrows =max(nrows, 2)
+component = 0
+for paramspace in paramspaces:
+    pnames = list(paramspace.variables.keys())
+    ncols = 3
+    nrows =int(math.ceil(1.0*len(pnames)/ncols))
+    nrows =max(nrows, 2)
 
-w_gauss_na = ctrldct["w_gauss_na"]
-w_gauss_br = ctrldct["w_gauss_br"]
-b_gauss_na = ctrldct["b_gauss_na"]
-b_gauss_br = ctrldct["b_gauss_br"]
-do_doublebroad = ctrldct["doublebroad"]
-nbins=[]
-ccol = ncols - 1
-crow = -1
-props = dict(facecolor='white', alpha=1.0)
-fig, ax = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows))
-for i in range(ncols*nrows):
-    if ccol == ncols - 1:
-        ccol = 0
-        crow = crow + 1
-    else:
-        ccol = ccol + 1
+    w_gauss_na = ctrldct["w_gauss_na"]
+    w_gauss_br = ctrldct["w_gauss_br"]
+    b_gauss_na = ctrldct["b_gauss_na"]
+    b_gauss_br = ctrldct["b_gauss_br"]
+    do_doublebroad = ctrldct["doublebroad"]
+    nbins=[]
+    ccol = ncols - 1
+    crow = -1
+    props = dict(facecolor='white', alpha=1.0)
+    fig, ax = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows))
+    for i in range(ncols*nrows):
+        if ccol == ncols - 1:
+            ccol = 0
+            crow = crow + 1
+        else:
+            ccol = ccol + 1
 
-    if i >= len(param_space):
-        ax[crow,ccol].axis('off')
-        continue
-    
-    start = param_space[i][0]
-    stop = param_space[i][1]
-    step = param_space[i][2]
-    width = stop - start
-    nbin = int(((width)/step) + 1)
-    nbins.append(nbin)
-    vlines = np.linspace(start, stop, nbin)
+        if i >= len(pnames):
+            ax[crow,ccol].axis('off')
+            continue
 
-    if ctrldct["narrow_type"] == 'frac':
-        sig_na = w_gauss_na * width
-    elif ctrldct["narrow_type"] == 'step':
-        sig_na = w_gauss_na * step
-    sig_br = w_gauss_br * width
-    b_na = b_gauss_na
-    b_br = b_gauss_br
-    xgauss = np.linspace(start, stop, 1000)
-    na_gauss = pop.gauss(xgauss, b_na, 1.0, start+int(nbin/2)*step, sig_na)
-    if do_doublebroad == 'yes':
-        br_gauss = pop.double_gauss(xgauss, b_br, 1.0, start+int(nbin/2)*step, 
-            sig_br)
-    else:
-        br_gauss = pop.gauss(xgauss, b_br, 1.0, start+int(nbin/2)*step, sig_br)
-    br_gauss = br_gauss / max(br_gauss)
-    na_gauss = na_gauss / max(na_gauss)
+        par = pnames[i]
 
-    for vline in vlines:
-        ax[crow,ccol].axvline(vline, lw=1.0, alpha=0.5)
-    if ctrldct['use_string'] not in ('y', 'yes', 'True', True):
-        ax[crow,ccol].plot(xgauss, na_gauss, 'red', lw=2)
-        ax[crow,ccol].plot(xgauss, br_gauss, 'orange', lw=2)
-    ax[crow,ccol].set_xlim(start-3*step, stop+3*step)
-    ax[crow,ccol].set_title(param_names[i])
-    ax[crow,ccol].set_yticks([])
-    boxtext = 'Step size: ' + str(step) + ',\n nsteps: ' + str(len(vlines))
-    ax[crow,ccol].text(0.05, 0.88, boxtext,
-        transform=ax[crow,ccol].transAxes, fontsize=9, bbox=props)
+        start = float(paramspace.variables[par][0])
+        stop = float(paramspace.variables[par][1])
+        step = float(paramspace.variables[par][2])
+        width = stop - start
+        nbin = int((width/step) + 1)
+        nbins.append(nbin)
+        vlines = np.linspace(start, stop, nbin)
 
-fig.suptitle('Parameter space check: ' + run_name, fontsize=14)
-fig.tight_layout(rect=[0, 0.03, 1, 0.93])
-plt.savefig(param_fig)  
-reportPDF.savefig()
-plt.close()
+        if ctrldct["narrow_type"] == 'frac':
+            sig_na = w_gauss_na * width
+        elif ctrldct["narrow_type"] == 'step':
+            sig_na = w_gauss_na * step
+        sig_br = w_gauss_br * width
+        b_na = b_gauss_na
+        b_br = b_gauss_br
+        xgauss = np.linspace(start, stop, 1000)
+        na_gauss = pop.Component.gauss(xgauss, b_na, 1.0, start+int(nbin/2)*step, sig_na)
+        if do_doublebroad == 'yes':
+            br_gauss = pop.Component.double_gauss(xgauss, b_br, 1.0, start+int(nbin/2)*step,
+                sig_br)
+        else:
+            br_gauss = pop.Component.gauss(xgauss, b_br, 1.0, start+int(nbin/2)*step, sig_br)
+        br_gauss = br_gauss / max(br_gauss)
+        na_gauss = na_gauss / max(na_gauss)
 
-print('\n       >  Plotted parameter space and mutation distributions') 
+        for vline in vlines:
+            ax[crow,ccol].axvline(vline, lw=1.0, alpha=0.5)
+        if ctrldct['use_string'] not in ('y', 'yes', 'True', True):
+            ax[crow,ccol].plot(xgauss, na_gauss, 'red', lw=2)
+            ax[crow,ccol].plot(xgauss, br_gauss, 'orange', lw=2)
+        ax[crow,ccol].set_xlim(start-3*step, stop+3*step)
+        ax[crow,ccol].set_title(par)
+        ax[crow,ccol].set_yticks([])
+        boxtext = 'Step size: ' + str(step) + ',\n nsteps: ' + str(len(vlines))
+        ax[crow,ccol].text(0.05, 0.88, boxtext,
+            transform=ax[crow,ccol].transAxes, fontsize=9, bbox=props)
+
+    fig.suptitle('Parameter space ' + str(component) + ' check: ' + run_name , fontsize=14)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.93])
+    plt.savefig(param_fig)
+    reportPDF.savefig()
+    plt.close()
+
+    print('\n       >  Plotted parameter space and mutation distributions of component ' + str(component))
+    component+=1
 
 ###################################
 #          Plot spectrum          #
 ###################################
 
 lnames, line_params = fw.read_linelist(linesetname)
-names, res, data_per_line, lweight = lineinfo
+names, res, epochs, lweight = lineinfo
 
 left_bounds = line_params[1]
 right_bounds = line_params[2]
 radial_vels = line_params[3]
 
-ncols = 4
-nrows =int(math.ceil(1.0*len(names)/ncols))
-nrows =max(nrows, 2)
+epochCount = 0
+for epoch in epochs:
+    activeNames = epoch.get_active_lines()
+    idx = np.where(np.isin(names, activeNames))[0]
+    activeRes = res[idx]
+    activeWeight = lweight[idx]
+    activeLbounds = left_bounds[idx]
+    activeRbounds = right_bounds[idx]
+    ncols = 4
+    nrows =int(math.ceil(1.0*len(activeNames)/ncols))
+    nrows =max(nrows, 2)
 
-ccol = ncols - 1
-crow = -1
-props = dict(facecolor='white', alpha=1.0)
-props2 = dict(facecolor='darkblue', alpha=0.8)
-errprops = dict(facecolor='red', alpha=1.0)
-fig, ax = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+    ccol = ncols - 1
+    crow = -1
+    props = dict(facecolor='white', alpha=1.0)
+    props2 = dict(facecolor='darkblue', alpha=0.8)
+    errprops = dict(facecolor='red', alpha=1.0)
+    fig, ax = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
 
-extra_AA = 2.0
-specwave, specflux, specerr = np.genfromtxt(spectrumname).T
-if np.count_nonzero(np.isnan(specflux)) > 0:
-    print("ERROR! Spectrum contains one or more NaN values")
-    print("   At wavelengths:")
-    for nanwave in specwave[np.isnan(specflux)]:
-        print("    * " + str(round(nanwave,3)))
-    print("\n> Could not make plot for " + run_name + ", exiting...")
-    sys.exit()
-specmin, specmax = np.min(specflux), np.max(specflux)
-for i in range(ncols*nrows):
-    if ccol == ncols - 1:
+    extra_AA = 2.0
+    specwave, specflux, specerr = epoch.wave, epoch.norm, epoch.error
+    if np.count_nonzero(np.isnan(specflux)) > 0:
+        print("ERROR! Spectrum contains one or more NaN values")
+        print("   At wavelengths:")
+        for nanwave in specwave[np.isnan(specflux)]:
+            print("    * " + str(round(nanwave,3)))
+        print("\n> Could not make plot for " + run_name + ", exiting...")
+        sys.exit()
+    specmin, specmax = min(specflux), max(specflux)
+    for i in range(ncols*nrows):
+        if ccol == ncols - 1:
+            ccol = 0
+            crow = crow + 1
+        else:
+            ccol = ccol + 1
 
-        ccol = 0
-        crow = crow + 1
-    else:
-        ccol = ccol + 1
+        if i >= len(activeNames):
+            ax[crow,ccol].axis('off')
+            continue
 
-    if i >= len(names):
-        ax[crow,ccol].axis('off')
-        continue 
+        linename = activeNames[i]
 
-    for j in range(len(lnames)):
-        if lnames[j] == names[i]:
-            lbound = fw.rvshift(left_bounds[j], radial_vels[j])
-            rbound = fw.rvshift(right_bounds[j], radial_vels[j])
-            the_rv = radial_vels[j]
-    wave, flux, err = data_per_line[i]
-    resolution = res[i]
-    linename = names[i]
-    weight = lweight[i]
 
-    specwave_rv = fw.rvshift(specwave, the_rv)
-    swave, sflux, serr = fw.parallelcrop(specwave_rv, specflux, specerr,
-        lbound-extra_AA, rbound+extra_AA)
+        # not implemented
+        # for j in range(len(lnames)):
+        #     if lnames[j] == names[i]:
+        #         lbound = fw.rvshift(left_bounds[j], radial_vels[j])
+        #         rbound = fw.rvshift(right_bounds[j], radial_vels[j])
+        #         the_rv = radial_vels[j]
 
-    npoint_error = False
-    if not len(wave) > len(param_names) + 1:
-        print('\nERROR! Too few data points for this line compared to ' 
-            'the amount of free parameters.')
-        print('Line: ' + linename)
-        print('Data points: ' + str(len(wave)))
-        print('Free params: ' + str(len(param_names))+'\n')
-        npoint_error = True
-    
-    if npoint_error:
-        ax[crow,ccol].axvspan(lbound,rbound, color='red', alpha=0.6)
-    elif weight != 1.0:
-        ax[crow,ccol].axvspan(lbound,rbound, color='green', alpha=0.3)
-    else:
-        ax[crow,ccol].axvspan(lbound,rbound, color='gold', alpha=0.3)
-    if the_rv != 0.0:
-        ax[crow, ccol].text(0.50, 0.9, "rv = " + str(the_rv) + ' km/s', 
-            transform=ax[crow,ccol].transAxes, fontsize=8, bbox=props2,
-            ha='center', color='white')
-    ax[crow,ccol].errorbar(swave, sflux, yerr=serr, ls='', fmt='o',
-        color='C0', alpha=0.5, markersize=3.0)
-    ax[crow,ccol].errorbar(wave, flux, yerr=err, ls='', fmt='o',
-        color='darkblue', markersize=3.0)
-    ax[crow,ccol].set_ylim(specmin, specmax)
-    ax[crow,ccol].set_title(linename)
-    ax[crow,ccol].axhline(1.0, lw=1.0, color='grey')
-    ax[crow,ccol].axvline(lbound, lw=1.0, color='red')
-    ax[crow,ccol].axvline(rbound, lw=1.0, color='red')
-    boxtext = 'R = ' + str(resolution) + ',\n weight = ' + str(weight)
-    ax[crow,ccol].text(0.05, 0.05, boxtext,
-        transform=ax[crow,ccol].transAxes, fontsize=8, bbox=props)
-    if npoint_error:
-        errortext = 'Not enough data points\n compared to #free parameters'
-        ax[crow,ccol].text(0.5, 0.5, errortext, ha='center',
-            transform=ax[crow,ccol].transAxes, fontsize=8, bbox=errprops,
-            color='white')
+        wave, flux, err = epoch.get_line_data(linename)
+        resolution = activeRes[i]
+        weight = activeWeight[i]
+        lbound = activeLbounds[i]
+        rbound = activeRbounds[i]
 
-fig.suptitle('Spectrum check: ' + run_name, fontsize=14)
-fig.tight_layout(rect=[0, 0.03, 1, 0.93])
-plt.savefig(spectrum_fig)
-reportPDF.savefig()
-plt.close()
+        # not implemented
+        # specwave_rv = fw.rvshift(specwave, the_rv)
+        # swave, sflux, serr = fw.parallelcrop(specwave_rv, specflux, specerr,
+        #     lbound-extra_AA, rbound+extra_AA)
 
-bc = 0
-for ii in range(len(ll_check[1])):
-    if ll_check[3][ii] - ll_check[2][ii] > wide_specrange_lim:
-        bc = bc + 1
+        npoint_error = False
+        if not len(wave) > nfree + 1:
+            print('\nERROR! Too few data points for this line compared to ' 
+                'the amount of free parameters.')
+            print('Line: ' + linename)
+            print('Data points: ' + str(len(wave)))
+            print('Free params: ' + str(nfree)+'\n')
+            npoint_error = True
 
-if bc > 0:
-    plc = -1
-    fig, ax = plt.subplots(bc, 1, figsize=(3*ncols, 2.0*bc))
-    for ii in range(len(lnames)):
-        lname0 = lnames[ii]
-        lbound = left_bounds[ii]
-        rbound = right_bounds[ii]
-        lwidth = rbound - lbound
-        if lwidth > wide_specrange_lim:
-            plc = plc + 1
-        
-            for j in range(len(lnames)):
-                if lnames[j] == lname0:
-                    lbound = fw.rvshift(left_bounds[j], radial_vels[j])
-                    rbound = fw.rvshift(right_bounds[j], radial_vels[j])
-                    the_rv = radial_vels[j]
-            wave, flux, err = data_per_line[ii]
-            resolution = res[ii]
-            linename = names[ii]
-            weight = lweight[ii]
+        if npoint_error:
+            ax[crow,ccol].axvspan(lbound,rbound, color='red', alpha=0.6)
+        elif weight != 1.0:
+            ax[crow,ccol].axvspan(lbound,rbound, color='green', alpha=0.3)
+        else:
+            ax[crow,ccol].axvspan(lbound,rbound, color='gold', alpha=0.3)
+        # if the_rv != 0.0:
+        #     ax[crow, ccol].text(0.50, 0.9, "rv = " + str(the_rv) + ' km/s',
+        #         transform=ax[crow,ccol].transAxes, fontsize=8, bbox=props2,
+        #         ha='center', color='white')
+        # ax[crow,ccol].errorbar(swave, sflux, yerr=serr, ls='', fmt='o',
+        #     color='C0', alpha=0.5, markersize=3.0)
+        ax[crow,ccol].errorbar(wave, flux, yerr=err, ls='', fmt='o',
+            color='darkblue', markersize=3.0)
+        ax[crow,ccol].set_ylim(specmin, specmax)
+        ax[crow,ccol].set_title(linename)
+        ax[crow,ccol].axhline(1.0, lw=1.0, color='grey')
+        ax[crow,ccol].axvline(lbound, lw=1.0, color='red')
+        ax[crow,ccol].axvline(rbound, lw=1.0, color='red')
+        boxtext = 'R = ' + str(resolution) + ',\n weight = ' + str(weight)
+        ax[crow,ccol].text(0.05, 0.05, boxtext,
+            transform=ax[crow,ccol].transAxes, fontsize=8, bbox=props)
+        if npoint_error:
+            errortext = 'Not enough data points\n compared to #free parameters'
+            ax[crow,ccol].text(0.5, 0.5, errortext, ha='center',
+                transform=ax[crow,ccol].transAxes, fontsize=8, bbox=errprops,
+                color='white')
 
-            specwave_rv = fw.rvshift(specwave, the_rv)
-            swave, sflux, serr = fw.parallelcrop(specwave_rv, specflux, 
-                specerr, lbound-extra_AA, rbound+extra_AA)
-
-            if bc > 1:
-                ax[plc].errorbar(swave, sflux, yerr=serr, ls='', fmt='o',
-                    color='C0', alpha=0.5, markersize=3.0)
-                ax[plc].errorbar(wave, flux, yerr=err, ls='', fmt='o',
-                    color='darkblue', markersize=3.0)
-                ax[plc].axhline(1.0, color='black', lw=1.0, zorder=0) 
-                ax[plc].set_title(lname0)
-            else:
-                ax.errorbar(swave, sflux, yerr=serr, ls='', fmt='o',
-                    color='C0', alpha=0.5, markersize=1.0)
-                ax.errorbar(wave, flux, yerr=err, ls='', fmt='o',
-                    color='darkblue', markersize=1.0)
-                ax.axhline(1.0, color='black', lw=1.0, zorder=0) 
-                ax.set_title(lname0)
-
-    plt.suptitle('Spectrum: larger plot for wide spectral regions')
+    fig.suptitle('Spectrum check epoch ' + str(epochCount) + ': ' + run_name, fontsize=14)
     fig.tight_layout(rect=[0, 0.03, 1, 0.93])
-    plt.savefig(spectrum_fig2)   
-    pdfs.append(spectrum_fig2)
+    plt.savefig(spectrum_fig)
     reportPDF.savefig()
-        
-print('       >  Plotted spectrum and line selection')
+    plt.close()
+
+    bc = 0
+    for ii in range(len(ll_check[1])):
+        if ll_check[3][ii] - ll_check[2][ii] > wide_specrange_lim:
+            bc = bc + 1
+
+    if bc > 0:
+        plc = -1
+        fig, ax = plt.subplots(bc, 1, figsize=(3*ncols, 2.0*bc))
+        for ii in range(len(activeNames)):
+            lname0 = activeNames[ii]
+            lbound = activeLbounds[ii]
+            rbound = activeRbounds[ii]
+            lwidth = rbound - lbound
+            if lwidth > wide_specrange_lim:
+                plc = plc + 1
+
+                # for j in range(len(lnames)):
+                #     if lnames[j] == lname0:
+                #         lbound = fw.rvshift(left_bounds[j], radial_vels[j])
+                #         rbound = fw.rvshift(right_bounds[j], radial_vels[j])
+                #         the_rv = radial_vels[j]
+                wave, flux, err = epoch.get_line_data(lname0)
+                resolution = res[ii]
+                weight = lweight[ii]
+
+                # specwave_rv = fw.rvshift(specwave, the_rv)
+                # swave, sflux, serr = fw.parallelcrop(specwave_rv, specflux,
+                #     specerr, lbound-extra_AA, rbound+extra_AA)
+
+                if bc > 1:
+                    # ax[plc].errorbar(swave, sflux, yerr=serr, ls='', fmt='o',
+                    #     color='C0', alpha=0.5, markersize=3.0)
+                    ax[plc].errorbar(wave, flux, yerr=err, ls='', fmt='o',
+                        color='darkblue', markersize=3.0)
+                    ax[plc].axhline(1.0, color='black', lw=1.0, zorder=0)
+                    ax[plc].set_title(lname0)
+                else:
+                    # ax.errorbar(swave, sflux, yerr=serr, ls='', fmt='o',
+                    #     color='C0', alpha=0.5, markersize=1.0)
+                    ax.errorbar(wave, flux, yerr=err, ls='', fmt='o',
+                        color='darkblue', markersize=1.0)
+                    ax.axhline(1.0, color='black', lw=1.0, zorder=0)
+                    ax.set_title(lname0)
+
+        plt.suptitle('Spectrum: larger plot for wide spectral regions')
+        fig.tight_layout(rect=[0, 0.03, 1, 0.93])
+        plt.savefig(spectrum_fig2)
+        pdfs.append(spectrum_fig2)
+        reportPDF.savefig()
+
+    print('       >  Plotted spectrum and line selection for epoch ' + str(epochCount))
+    epochCount += 1
 
 reportPDF.close()
+
 for pdf in pdfs:
-    os.system("rm " + pdf)
+    os.remove(pdf)
 
 n_node = int((ctrldct["nind"]+1)/n_cpu_core)
 n_cpu = ctrldct["nind"]+1
@@ -985,15 +1003,14 @@ else:
 
 jobscript = f"""#!/bin/bash
 #SBATCH --job-name={run_name}
-#SBATCH --time {hours_str}:00:00
-#SBATCH -N {str(n_node)}
-#SBATCH --ntasks-per-node={ci.cores_per_node}
-#SBATCH --no-requeue
+#SBATCH --time={minutes_str}
+#SBATCH --ntasks={ci.cores_per_node}
+#SBATCH --cpus-per-task=1
 {ci.extra_sbatch % (run_name, run_name)}
 
 runname={run_name}
 do_restart={do_restart}
-ncpu={str(ctrldct["nind"]+1)}
+ncpu={str(ctrldct["nind"]*2+1)}
 inidir={test_inidir}
 
 echo Run ${{runname}}
@@ -1006,17 +1023,37 @@ echo Do restart? $do_restart
 # Define paths
 scratch=/{ci.scratch_loc}/{username}/${{runname}}/
 homedir=/{ci.home_loc}/{username}/{codedir}/
+results=/{ci.home_loc}/{username}/{codedir}/runs/${{runname}}/
 
-echo Copying files
+echo Deleting and rebuilding scratch
 
-# Create and copy directories and files
+# Delete scratch and copying back the needed files
+rm -rf $scratch
 mkdir -p $scratch
+mkdir -p ${{scratch}}output/
 cp -r ${{homedir}}*.py $scratch
 cp -r ${{homedir}}filter_transmissions $scratch
 mkdir -p ${{scratch}}input/
 mkdir -p ${{scratch}}input/${{runname}}/
 cp -r ${{homedir}}input/${{runname}}/* ${{scratch}}input/${{runname}}/.
 cp -r ${{homedir}}${{inidir}} $scratch
+
+
+echo Puting results back in case of a restart
+
+if [ "$do_restart" == "yes" ]
+then
+    cp -r $results/saved ${{scratch}}output/
+    cp $results/mutation_by_gen.txt ${{scratch}}output/
+    cp $results/redchi2s_cont.txt ${{scratch}}output/
+    cp $results/savefitness_cont.txt ${{scratch}}output/
+    cp $results/chi2_cont.csv ${{scratch}}output/
+    cp $results/precomp_cont.csv ${{scratch}}output/
+    cp $results/savegen_cont.pkl ${{scratch}}output/
+else
+    rm -rf $results
+    mkdir $results
+fi
 
 # Navigate to computation directory
 cd $scratch
@@ -1028,16 +1065,22 @@ date
 if [ "$do_restart" == "yes" ]
 then
     echo ...restarting run
-    {run_string}
+    {run_string} -c
 else
-    echo ... creating output dir
-    mkdir -p output
     echo ... starting run
     {run_string}
 fi
 
 date
 echo ... Run ENDED!
+
+echo Copying relevant results:
+rm -rf output/run/
+cp -r output/. $results
+
+echo Deleting scratch
+cd $homedir
+rm -rf $scratch
 """
 
 f = open(jobscriptfile, "w")

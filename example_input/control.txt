@@ -1,18 +1,24 @@
-nind  		          127             # number of models per generation
-ngen 		          30              # number of generations
+nind  		          107             # number of individuals per generation
+ngen 		          100              # number of generations
 
 # Detailed parameters controlling population size
-f_gen1                2.365            # nind in first gen = nind*f_gen1
+f_gen1                2.0              # nind in first gen = nind*f_gen1, deprecated in multiple kiwi GA
 ratio_po              1.33             # Ratio parent/offspring population
 f_parent              0.25             # Fraction of parents kept
                                        # must satisfy: f_parent >= 1-1/ratio_po
 
+#computationally enforced time limit:
+program_time_limit    4320m            # maximum runtime of Kiwi GA
+
+#LMC (metal 0.5) or SMC (metal 0.2) or GAL
+location              LMC
+
 # Specify fitting method and fastwind properties
 fitmeasure 	          chi2             # fitness measure used for reproduction
                                        # choose between 'chi2' or 'fitness'
-modelatom             A10HHeCNOPSi     # fastwind model atom
-fw_timeout            52m              # maximum runtime of fastwind
-inicalcdir            v106_HHeNCOPSi/  # relative path to inicalc master
+modelatom             A11HHeCnewNOSi   # fastwind model atom
+fw_timeout            80m              # maximum runtime of fastwind
+inicalcdir            v10_inicalc/     # relative path to inicalc master
 p_value               0.05             # cutoff value for P
 
 # Parameters controlling mutation and reproduction
@@ -28,7 +34,7 @@ mut_rate_na           0.50             # mut. rate of narrow gauss mutation
 mut_rate_init         0.05             # initial rate of broad gauss. mutation
 mut_adjust_type       constant         # 'constant' 'charbonneau' or 'autocharb'
 mut_rate_min          0.005            # minimum mutation rate
-mut_rate_max          0.200            # maximum mutation rate
+mut_rate_max          0.133            # maximum mutation rate
 mut_rate_factor       1.5              # factor of mutation rate change
 fit_cutoff_min_charb  0.025            # 'charbonneau' minimum fitness cutoff
 fit_cutoff_max_charb  0.05             # 'charbonneau' maximum fitness cutoff
@@ -45,7 +51,7 @@ sigs_string           2                # only when use_string='yes' don't change
 fracdouble_string     0.5              # only when use_string='yes' relates to crossover
 
 # Other parameters
-be_verbose     	      True             # specify verbosity
+be_verbose     	      Y             # specify verbosity, can be N(o), M(inimal) or Y(es)
 f_uni                 0.3              # No longer in use
 doerr_factor          1.5              # No longer in use
 cutoff_increase_genv  1.0              # min. cutoff mutation rate 'genvariety'

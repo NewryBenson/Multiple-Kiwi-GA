@@ -50,3 +50,6 @@ gamx           0.75
 Rinx           1.5
 logfx          10.0
 xpow           -1000
+ratio          1.0
+vinf           -1.0
+vrad_guess     0.0

@@ -1,22 +1,21 @@
-# Estimate the stellar radius given an effective temperature
-# and magnitude. Requires filter transmissions and zero points.
-# Created by Sarah Brands on 20 Dec 2019 (s.a.brands@uva.nl)
-
-import __future__
 import numpy as np
 import sys
-from scipy.interpolate import interp1d
+if hasattr(np, "trapezoid"):
+    trapezoid = np.trapezoid
+else:
+    trapezoid = np.trapz
 
-
-def magnitude_to_radius(teff, band, obsmag, zp_system, Tfrac=0.9,
+def magnitude_to_radius(teffs: list[float], ratios: list[float], band, obsmag, zp_system, Tfrac=0.9,
     filterdir='filter_transmissions/'):
+
+
 
     '''Estimate the radius of the star given a temperature,
     photometric filter and observed (dereddened) absolute
     magnitude.
 
     Input:
-     - teff: model effective temperature in K (float)
+     - teff1: model effective temperature in K (float)
      - band: name of the photometric band (string), see section
        'Available photometric bands' at the start of of this
        functions for which ones are included, and the
@@ -29,9 +28,11 @@ def magnitude_to_radius(teff, band, obsmag, zp_system, Tfrac=0.9,
      - zp_system: choose from 'vega', 'AB', 'ST' (string)
      - filterdir: specify (relative) path to the directory
        where the filter information is stored (string)
+     - teff2: model effective temperature of companion in K (float), 0 corresponds to the single star case
+     - R: model radius ratio R2/R1. 0 corresponds to the single star case
 
     Output:
-     - Estimated stellar radius in solar units (float)
+     - Estimated stellar radius in solar units (float) of both companions, for single stars, only the first return value should be used (the other will be 0)
 
     NOTE ON ADDING NEW FILTERS
 
@@ -70,6 +71,8 @@ def magnitude_to_radius(teff, band, obsmag, zp_system, Tfrac=0.9,
 
     '''
 
+
+
     ##########################################################
     ###            Available photometric bands             ###
     ##########################################################
@@ -85,7 +88,7 @@ def magnitude_to_radius(teff, band, obsmag, zp_system, Tfrac=0.9,
         waveunit = 'angstrom'
     elif band == 'VISTA_Ks':
         filterfile = 'Paranal_VISTA.Ks.dat'
-        waveunit = 'angstrom'    
+        waveunit = 'angstrom'
     elif band == 'Johnson_V':
         filterfile = 'GCPD_Johnson.V.dat'
         waveunit = 'angstrom'
@@ -102,7 +105,7 @@ def magnitude_to_radius(teff, band, obsmag, zp_system, Tfrac=0.9,
 
     # Read transmission profile and convert units if necessary
     filterfile = filterdir + filterfile
-    wave, trans = np.genfromtxt(filterfile, comments='#').T
+    wave, trans = np.loadtxt(filterfile, comments='#', unpack=True)
 
     if waveunit == 'nm':
         nm_to_Angstrom = 10
@@ -131,22 +134,29 @@ def magnitude_to_radius(teff, band, obsmag, zp_system, Tfrac=0.9,
         print('Zero point for band ' + band + ' not found, exiting')
         sys.exit()
 
-    tBB = teff * Tfrac
+    tBBs = [teff * Tfrac for teff in teffs]
 
     # Integration over angles results in the factor of pi
-    F_lambda = np.pi*planck_wavelength(wave, tBB)
+    F_lambdas = [np.pi * planck_wavelength(wave, tBB) for tBB in tBBs]
 
     rsun = 6.96e10
     parsec_cm = 3.08567758e18
-    radius_ratio = 10*parsec_cm / rsun
 
-    filtered_flux = np.trapz(trans*F_lambda, wave)/np.trapz(trans, wave)
+    filtered_fluxes = [trapezoid(trans*F_lambda, wave)/trapezoid(trans, wave) for F_lambda in F_lambdas]
+
     obsflux = magnitude_to_flux(obsmag, the_zero_point)
-    bolflux_10pc = obsflux/filtered_flux
-    luminosity = bolflux_10pc * (10*parsec_cm / rsun)**2
-    radius_rsun = luminosity**0.5
 
-    return radius_rsun
+    d = 10 * parsec_cm / rsun
+
+    denom = 0
+    for i in range(len(ratios)):
+        filtered_flux = filtered_fluxes[i]
+        ratio = ratios[i]
+        denom += filtered_flux * ratio**2
+    R = d*np.sqrt(obsflux/denom)
+    radii = [R * ratio for ratio in ratios]
+
+    return radii
 
 def planck_wavelength(wave_angstrom, temp):
     ''' Calculate the Planck function as function of temperature,
@@ -175,55 +185,7 @@ def magnitude_to_flux(magnitude, zpflux):
     obsflux = zpflux * 10**(-magnitude/2.5)
     return obsflux
 
-def magnitude_to_radius_SED(sed_wave, sed_flam, band, obsmag, zp_system,
-    filterdir='filter_transmissions/'):
-
-    '''Estimate the radius of the star given a temperature,
-    photometric filter and observed (dereddened) absolute
-    magnitude.
-
-    Input:
-     - band: name of the photometric band (string), see section
-       'Available photometric bands' at the start of of this
-       functions for which ones are included, and the
-       description below on how to add more.
-     - obsmag: the observed absolute magnitude in the given
-       band (float)
-     - zp_system: choose from 'vega', 'AB', 'ST' (string)
-     - filterdir: specify (relative) path to the directory
-       where the filter information is stored (string)
-
-    Output:
-     - Estimated stellar radius in solar units (float)
-
-    NOTE ON ADDING NEW FILTERS
-
-    A useful resource for filter information is the
-    SVO Filter Profile Service:
-       http://svo2.cab.inta-csic.es/theory/fps/
-
-    When adding a new filter, please do the following:
-    1. Place an asci file with wavelengths and transmissions in
-       the filter directory (specified in the parameter
-       'filterdir'. In this file, lines with columns names or
-       headers should start with a '#'. Wavelengths can be in
-       Angstrom or nm (see next point).
-    2. Add an 'elif' statement in the code below under 'Available
-       photometric bands', in which you give the filter a clear
-       and descriptive name, and point to the transmission file.
-       Wavelength units in the data file can be either nanometers
-       or Angstrom, specify which one is used in the file in the
-       parameter 'waveunit' in the elif statement.
-    3. Add zero points to the file 'zero_points.dat' in the
-       filterdirectory. In the first column give the name of
-       the filter: use the same name as in point 2.
-
-    '''
-
-    ##########################################################
-    ###            Available photometric bands             ###
-    ##########################################################
-
+def get_synthetic_magnitude(teffs: list[float], radii: list[float], band, zp_system, Tfrac = 0.9, filterdir='filter_transmissions/'):
     if band == 'SPHERE_Ks':
         filterfile = 'SPHERE_IRDIS_B_Ks.dat'
         waveunit = 'nm'
@@ -252,7 +214,7 @@ def magnitude_to_radius_SED(sed_wave, sed_flam, band, obsmag, zp_system,
 
     # Read transmission profile and convert units if necessary
     filterfile = filterdir + filterfile
-    wave, trans = np.genfromtxt(filterfile, comments='#').T
+    wave, trans = np.loadtxt(filterfile, comments='#', unpack=True)
 
     if waveunit == 'nm':
         nm_to_Angstrom = 10
@@ -281,17 +243,24 @@ def magnitude_to_radius_SED(sed_wave, sed_flam, band, obsmag, zp_system,
         print('Zero point for band ' + band + ' not found, exiting')
         sys.exit()
 
-    sed_ip = interp1d(sed_wave, sed_flam)
-    F_lambda = sed_ip(wave)
+    tBBs = [teff * Tfrac for teff in teffs]
+
+    # Integration over angles results in the factor of pi
+    F_lambdas = [np.pi * planck_wavelength(wave, tBB) for tBB in tBBs]
 
     rsun = 6.96e10
     parsec_cm = 3.08567758e18
-    radius_ratio = 10*parsec_cm / rsun
 
-    filtered_flux = np.trapz(trans*F_lambda, wave)/np.trapz(trans, wave)
-    obsflux = magnitude_to_flux(obsmag, the_zero_point)
-    bolflux_10pc = obsflux/filtered_flux
-    luminosity = bolflux_10pc * (10*parsec_cm / rsun)**2
-    radius_rsun = luminosity**0.5
+    filtered_fluxes = [trapezoid(trans*F_lambda, wave)/trapezoid(trans, wave) for F_lambda in F_lambdas]
 
-    return radius_rsun
+    d = 10 * parsec_cm / rsun
+
+    denom = 0
+    for i in range(len(radii)):
+        filtered_flux = filtered_fluxes[i]
+        radius = radii[i]
+        denom += filtered_flux * radius**2
+
+    obsflux = denom/d**2
+    magnitude = -2.5*np.log10(obsflux/the_zero_point)
+    return magnitude
