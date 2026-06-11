@@ -1,9 +1,12 @@
 # Functions for GA analysis script part of Kiwi-GA
 # Created by Sarah Brands @ 29 July 2022
-
+import copy
+import functools
 import os
 import sys
 import math
+import tarfile
+import shutil
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -11,10 +14,16 @@ from scipy import stats
 from scipy.interpolate import interp1d
 from matplotlib import pyplot as plt
 import matplotlib.image as mpimg
+
 import fastwind_wrapper as fw
 import magnitude_to_radius as m2r
+import population as pop
+from epoch import Epoch
 
 RMSEA_THRESHOLD = 1.5
+
+def load_snapshot(savedmoddir, gen):
+    return pop.Population.from_file(savedmoddir + str(gen).zfill(4) + '/' + str(gen).zfill(4) + '_snapshot.pkl')
 
 def get_luminosity(Teff, radius):
     '''Calculate L in terms of log(L/Lsun), given Teff (K)
@@ -86,8 +95,8 @@ def get_vesc_eff(mass, radius, GammE):
 
     mass_eff = mass*(1-GammE)
 
-    neg_idx = np.less_equal(mass_eff, 0)
-    mass_eff[neg_idx] = 0
+    if mass_eff < 0:
+        mass_eff = 0
 
     vesc_cms = np.sqrt((2*Gcgs*mass_eff*Msun)/(radius*Rsun))
     vesc_kms = vesc_cms*1e-5
@@ -203,7 +212,7 @@ def magnitude_to_radius_SED(sed_wave, sed_flam, band, obsmag, zp_system,
 
     # Read transmission profile and convert units if necessary
     filterfile = filterdir + filterfile
-    wave, trans = np.genfromtxt(filterfile, comments='#').T
+    wave, trans = np.loadtxt(filterfile, comments='#', unpack=True)
 
     if waveunit == 'nm':
         nm_to_Angstrom = 10
@@ -247,100 +256,77 @@ def magnitude_to_radius_SED(sed_wave, sed_flam, band, obsmag, zp_system,
 
     return radius_rsun
 
-def more_parameters(df, param_names, fix_names, fix_vals):
-    fix_dict = dict(zip(fix_names, fix_vals))
+def more_parameters(populations: list[pop.Population]):
+    plists = []
+    example = populations[-1].population[0]
+    for comp in example.components:
+        plist = {'logL', 'radius', 'Mspec', 'Gamma_Edd', 'vesc_eff', 'logq0', 'logQ0', 'logq1', 'logQ1', 'logq2', 'logQ2'}
+        for epoch_name, vrad in comp.vrads.items():
+            plist.add(epoch_name.split('/')[-1])
+        all_params = comp.parameters.keys()
+        for param in all_params:
+            if not param in comp.template.variables.keys():
+                if param in comp.template.fixed.keys():
+                    orig_val = comp.template.fixed[param]
+                    if orig_val == 'T' or orig_val == 'F':
+                        pass
+                    elif '.' in orig_val:
+                        orig_val = float(orig_val)
+                    else:
+                        orig_val = int(orig_val)
+                    if orig_val != comp.parameters[param]:
+                        plist.add(param)
+                else:
+                    plist.add(param)
+        if 'xlum' in comp.template.variables.keys():
+            plist.add('logxlum')
+        if 'vinf' in all_params:
+            plist.add('vinf_vesc')
+        if 'windturb' in all_params and 'vinf' in all_params:
+            plist.add('windturb_kms')
+        if 'mdot' in all_params and 'fclump' in all_params:
+            plist.add('mdot_fclump')
+        plists.append(sorted(list(plist)))
 
-    # List of parameters that are plotted in the extra parameter fitness plot
-    # Always plot Q-parameters, luminosity, radius and spectroscopic mass, Gamma
-    plist = ['logL', 'radius', 'Mspec', 'Gamma_Edd', 'vesc_eff',
-        'logq0', 'logQ0', 'logq1', 'logQ1', 'logq2', 'logQ2']
+    for generation in populations:
+        for individual in generation.population:
+            for comp, plist in zip(individual.components, plists):
+                for epoch_name, vrad in comp.vrads.items():
+                    comp.parameters[epoch_name.split('/')[-1]] = float(vrad)
+                comp.parameters['mdot'] = np.log10(float(comp.parameters['mdot']))
+                comp.parameters['radius'] = comp.radius
+                # Always get the luminosity and spectroscopic mass and Eddington factor
+                comp.parameters['logL'] = get_luminosity(comp.parameters['teff'], comp.parameters['radius'])
+                comp.parameters['Mspec'] = get_mass(comp.parameters['logg'], comp.parameters['radius'])
+                comp.parameters['Gamma_Edd'] = get_Gamma_Edd(10**comp.parameters['logL'], comp.parameters['Mspec'])
+                comp.parameters['vesc_eff'] = get_vesc_eff(comp.parameters['Mspec'], comp.parameters['radius'],comp.parameters['Gamma_Edd'])
 
-    for par in ['logq0', 'logQ0', 'logq1', 'logQ1', 'logq2', 'logQ2']:
-        if par not in df.columns:
-            plist.remove(par)
+                # If X-rays are given and variable then include them
+                if 'logxlum' in plist:
+                    if float(comp.parameters['xlum']) <= 0:
+                        comp.parameters['xlum'] = 1e-20
+                    comp.parameters['logxlum'] = np.log10(float(comp.parameters['xlum']))
 
-    # Always get the luminosity and spectroscopic mass and Eddington factor
-    if 'teff' in df.columns:
-        df['logL'] = get_luminosity(df['teff'], df['radius'])
-    else:
-        df['logL'] = get_luminosity(fix_dict['teff'], df['radius'])
+                # Other derived parameters are only computed when relevant.
+                if 'vinf_vesc' in plist:
+                    comp.parameters['vinf_vesc'] = comp.parameters['vinf']/comp.parameters['vesc_eff']
+                if 'windturb_kms' in plist:
+                    comp.parameters['windturb_kms'] = comp.parameters['windturb'] * comp.parameters['vinf']
+                if 'mdot_fclump' in plist:
+                    comp.parameters['mdot_fclump'] = np.log10(10**comp.parameters['mdot'] * np.sqrt(comp.parameters['fclump']))
 
-    if 'logg' in df.columns:
-        df['Mspec'] = get_mass(df['logg'], df['radius'])
-    else:
-        df['Mspec'] = get_mass(fix_dict['logg'], df['radius'])
+    return plists
 
-    df['Gamma_Edd'] = get_Gamma_Edd(10**df['logL'], df['Mspec'])
-    df['vesc_eff'] = get_vesc_eff(df['Mspec'], df['radius'],df['Gamma_Edd'])
 
-    # If X-rays are given and variable then include them
-    if 'xlum' in df.columns:
-        the_xlum = df['xlum'].values
-        if np.min(the_xlum) != np.max(the_xlum):
-            nan_logx = np.less_equal(the_xlum,0)
-            the_xlum[nan_logx] = 1e-20
-            the_logxlum = np.log10(the_xlum)
-            the_logxlum[nan_logx] = math.nan
-            df['logxlum'] = the_logxlum
-            plist.append('logxlum')
-
-    # Retreive fx in case it was estimated to get a fixed logxlum
-    if 'fx' not in df.columns and 'fx' in fix_names:
-        if ('logfx' not in df.columns) and (np.abs(fix_dict['fx']) > 1000.0):
-            if 'mdot' in df.columns:
-                the_mdot = df['mdot'].values
-            else:
-                the_mdot = fix_dict['mdot']*np.ones(len(df))
-            if 'vinf' in df.columns:
-                the_vinf = df['vinf'].values
-            elif 'vinf' in fix_dict.keys():
-                the_vinf = fix_dict['vinf']*np.ones(len(df))
-            else:
-                the_vinf = 2.6*df['vesc_eff'].values
-                print('WARNING: assuming vinf = 2.6 vesc for all Teffs')
-            the_radius = df['radius'].values
-            the_logfxlist = []
-            for i in range(len(df)):
-                fxdct = {'radius':the_radius[i],
-                         'vinf':the_vinf[i],
-                         'mdot':10**the_mdot[i]}
-                if float(fix_dict['fx']) > 1000.0:
-                    the_fx = np.log10(float(fw.get_fx_obs(fxdct)['fx']))
-                    the_logfxlist.append(the_fx)
-                elif float(fix_dict['fx']) < -1000.0:
-                    the_fx = np.log10(float(fw.get_fx_theory(fxdct)['fx']))
-                    the_logfxlist.append(the_fx)
-            df['logfx'] = the_logfxlist
-            plist.append('logfx')
-
-    # Other derived parameters are only computed when relevant.
-    if 'vinf' in df.columns:
-        df['vinf_vesc'] = df['vinf']/df['vesc_eff']
-        plist.append('vinf_vesc')
-
-    if 'windturb' in df.columns and 'vinf' in df.columns:
-        df['windturb_kms'] = df['windturb'] * df['vinf']
-        plist.append('windturb_kms')
-    if 'mdot' in df.columns and 'fclump' in df.columns:
-        df['mdot_fclump'] = np.log10(10**df['mdot'] * np.sqrt(df['fclump']))
-        plist.append('mdot_fclump')
-    elif 'mdot' in df.columns:
-        df['mdot_fclump'] = np.log10(10**df['mdot'] * np.sqrt(fix_dict['fclump']))
-        plist.append('mdot_fclump')
-    elif 'fclump' in df.columns:
-        df['mdot_fclump'] = np.log10(10**fix_dict['mdot'] * np.sqrt(df['fclump']))
-        plist.append('mdot_fclump')
-
-    return df, plist
-
-def calculateP(chi2, degreesFreedom, normalize):
+def calculateP(chi2, best_chi2, degreesFreedom, normalize):
     """
     Based on the chi2 value of a model, compute the P-value
     Before this is done, all chi2 values are normalised by the lowest
     chi2 value of the run.
     """
+
     if normalize:
-        scaling = np.min(chi2)
+        scaling = best_chi2
     else:
         scaling = degreesFreedom
 
@@ -354,15 +340,8 @@ def calculateP(chi2, degreesFreedom, normalize):
         print("chi2 of all models artificially lowered in order to enlarge")
         print("uncertainties\n\n\n")
 
-    chi2 = correction_factor * (chi2 * degreesFreedom) / scaling
-    probs = np.zeros_like(chi2)
-    try:
-        for i in range(len(chi2)):
-            probs[i] = stats.chi2.sf(chi2[i], degreesFreedom)
-    except:
-        chi2 = chi2.values
-        for i in range(len(chi2)):
-            probs[i] = stats.chi2.sf(chi2[i], degreesFreedom)
+    chi2 =  correction_factor * (chi2 * degreesFreedom) / scaling
+    probs = stats.chi2.sf(chi2, degreesFreedom)
     return probs
 
 def calculateP_noncent(chi2, degreesFreedom, lambda_nc):
@@ -426,180 +405,367 @@ def update_magnitude(m_name_orig, m_value_orig, m_system_orig,
 
 def radius_correction(df, fw_path, runname, thecontrolfile, theradiusfile,
     datapath, outpath, comp_fw):
-
     radcorrfile = outpath + 'radius_correction.txt'
     if os.path.isfile(radcorrfile):
-        os.system('rm ' + radcorrfile)
+        os.remove(radcorrfile)
 
     xbest = pd.Series.idxmin(df['rchi2'])
-    best_model_name = df['run_id'][xbest]
+    best_model_name = df['#run_id'][xbest]
     print('Best model:', best_model_name)
     best_gen_name = best_model_name.split('_')[0]
     bestmod_fw = fw_path + runname + '_' + best_model_name + '/'
     savemoddir = datapath + 'saved/' + best_gen_name + '/'
-    the_best_indat = savemoddir + best_model_name + '/INDAT.DAT'
-    if not os.path.isfile(bestmod_fw + 'FLUXCONT'):
-        if comp_fw:
-            os.system('mkdir -p ' + bestmod_fw)
-            moddir = savemoddir + best_model_name + '/'
-            modtar = savemoddir + best_model_name + '.tar.gz'
-            if not os.path.isdir(moddir):
-                os.system('mkdir -p ' + moddir)
-                os.system('tar -xzf ' + modtar + ' -C ' + moddir + '/.')
-            os.system('cp ' + the_best_indat + ' ' + fw_path + '.')
-            fwindat = fw_path + 'INDAT.DAT'
-            pnlte_logfile = (fw_path + runname + '_' + best_model_name
-                + '.pnltelog')
+    bestmoddir = savemoddir + best_model_name.split('_')[1] + '/'
+    if not os.path.isdir(bestmoddir + 'combined/'):
+        fw.mkdir(bestmoddir + 'combined/')
+        fw.untar(bestmoddir + 'combined.tar.gz', bestmoddir + 'combined/')
+    params = pd.read_csv(bestmoddir + 'combined/params.csv')
+    if not os.path.isdir(bestmoddir + '0/'):
+        for index, row in params.iterrows():
+            newloc = bestmoddir + str(index) + '/'
+            name = row['run_id']
+            compparts = name.split('_')
+            compname = str(index)
+            if len(compparts) == 4:
+                compname += '_' + compparts[-1]
+            fw.mkdir(newloc)
+            fw.untar(bestmoddir + compname + '.tar.gz', newloc)
+    the_best_indats = []
+    for index, row in params.iterrows():
+        newloc = bestmoddir + str(index) + '/'
+        the_best_indats.append(newloc + 'INDAT.DAT')
 
-            with open(fwindat) as f:
-                lines = f.readlines()
-            lines[0] = "'" + runname + '_' + best_model_name + "'\n"
-            with open(fwindat, "w") as f:
-                f.writelines(lines)
+    if False:
+        if not os.path.isfile(bestmod_fw + 'FLUXCONT'):
+            if comp_fw:
+                for best_indat in the_best_indats:
+                    os.system('mkdir -p ' + bestmod_fw)
+                    moddir = savemoddir + best_model_name + '/'
+                    modtar = savemoddir + best_model_name + '.tar.gz'
+                    if not os.path.isdir(moddir):
+                        os.system('mkdir -p ' + moddir)
+                        os.system('tar -xzf ' + modtar + ' -C ' + moddir + '/.')
+                    os.system('cp ' + best_indat + ' ' + fw_path + '.')
+                    fwindat = fw_path + 'INDAT.DAT'
+                    pnlte_logfile = (fw_path + runname + '_' + best_model_name
+                        + '.pnltelog')
 
-            for acontrl in np.genfromtxt(thecontrolfile,dtype='str'):
-                if acontrl[0] == 'modelatom':
-                    modelatom = acontrl[1]
-                    break
-            currentdir = os.getcwd()
-            os.chdir(fw_path)
-            print('Start FASTWIND Computation ...', 3*'\n...')
-            print('    ... pnlte output here: ' + pnlte_logfile)
-            runpnlte = './pnlte_' + modelatom + '.eo > ' + pnlte_logfile
-            os.system(runpnlte)
-            os.chdir(currentdir)
-            if os.path.isfile(bestmod_fw + 'FLUXCONT'):
-                corr_ready = True
-                os.system('rm ' + pnlte_logfile)
+                    with open(fwindat) as f:
+                        lines = f.readlines()
+                    lines[0] = "'" + runname + '_' + best_model_name + "'\n"
+                    with open(fwindat, "w") as f:
+                        f.writelines(lines)
 
+                    for acontrl in np.genfromtxt(thecontrolfile,dtype='str'):
+                        if acontrl[0] == 'modelatom':
+                            modelatom = acontrl[1]
+                            break
+                    currentdir = os.getcwd()
+                    os.chdir(fw_path)
+                    print('Start FASTWIND Computation ...', 3*'\n...')
+                    print('    ... pnlte output here: ' + pnlte_logfile)
+                    runpnlte = './pnlte_' + modelatom + '.eo > ' + pnlte_logfile
+                    os.system(runpnlte)
+                    os.chdir(currentdir)
+                    if os.path.isfile(bestmod_fw + 'FLUXCONT'):
+                        corr_ready = True
+                        os.system('rm ' + pnlte_logfile)
+
+                    else:
+                        print('\n\n\nERROR! fw model could not compute, check!\n\n\n')
+                        corr_ready = False
             else:
-                print('\n\n\nERROR! fw model could not compute, check!\n\n\n')
                 corr_ready = False
         else:
-            corr_ready = False
+            corr_ready = True
+
+        if corr_ready:
+            lam, flam = get_fw_fluxcont(bestmod_fw)
+
+            fwindat = fw_path + 'INDAT.DAT'
+
+            rsun = 6.96e10 # cm
+            tefffact = 0.9
+            mod_rstar = float(open(fwindat, 'r').readlines()[3].strip().split()[-1])
+            stellar_surface = 4*np.pi*(rsun*mod_rstar)**2
+
+            m_name = np.genfromtxt(theradiusfile, dtype='str')[0]
+            m_value = np.genfromtxt(theradiusfile)[1]
+            m_system = np.genfromtxt(theradiusfile, dtype='str')[2]
+
+            m_name, m_value, m_system = update_magnitude(m_name, m_value, m_system,
+                runname)[:3]
+
+            new_rad = magnitude_to_radius_SED(lam, flam/stellar_surface,
+                m_name, m_value, m_system,
+                filterdir='filter_transmissions/')
+
+            radius_ratio = new_rad/mod_rstar
+
+            df['Q_radius_old'] = (10**df['mdot'])/(df['radius'])**(3./2.)
+
+            # Correct all radii with the perc. correction from the best fit model.
+            df['radius'] = df['radius']*radius_ratio
+
+            # Correct mass loss rates by assuming a fixed Q value (Puls+96)
+            df['mdot'] = np.log10(df['Q_radius_old']*(df['radius'])**(3./2.))
+
+            df['q0'] = 10**df['logq0']
+            df['logQ0'] = np.log10(df['q0']*4*np.pi*(rsun*df['radius'])**2)
+            df['q1'] = 10**df['logq1']
+            df['logQ1'] = np.log10(df['q1']*4*np.pi*(rsun*df['radius'])**2)
+            df['q2'] = 10**df['logq2']
+            df['logQ2'] = np.log10(df['q2']*4*np.pi*(rsun*df['radius'])**2)
+
+            with open(radcorrfile, 'w') as f:
+                f.write('# Radius corretion (= corrected radius/estimated radius\n')
+                f.write(str(radius_ratio) + '\n')
+
+        else:
+            print("WARNING! No radius correction done. ")
     else:
-        corr_ready = True
+        print("WARNING! No radius correction done. Currently not implemented")
+    return df, the_best_indats, best_model_name, bestmoddir
 
-    if corr_ready:
-        lam, flam = get_fw_fluxcont(bestmod_fw)
+def get_uncertainties(best_model: pop.Individual, populations: list[pop.Population], npspec, paramspaces: list[pop.Template], deriv_pars, incl_deriv=True):
 
-        fwindat = fw_path + 'INDAT.DAT'
-
-        rsun = 6.96e10 # cm
-        tefffact = 0.9
-        mod_rstar = float(open(fwindat, 'r').readlines()[3].strip().split()[-1])
-        stellar_surface = 4*np.pi*(rsun*mod_rstar)**2
-
-        m_name = np.genfromtxt(theradiusfile, dtype='str')[0]
-        m_value = np.genfromtxt(theradiusfile)[1]
-        m_system = np.genfromtxt(theradiusfile, dtype='str')[2]
-
-        m_name, m_value, m_system = update_magnitude(m_name, m_value, m_system,
-            runname)[:3]
-
-        new_rad = magnitude_to_radius_SED(lam, flam/stellar_surface,
-            m_name, m_value, m_system,
-            filterdir='filter_transmissions/')
-
-        radius_ratio = new_rad/mod_rstar
-
-        df['Q_radius_old'] = (10**df['mdot'])/(df['radius'])**(3./2.)
-
-        # Correct all radii with the perc. correction from the best fit model.
-        df['radius'] = df['radius']*radius_ratio
-
-        # Correct mass loss rates by assuming a fixed Q value (Puls+96)
-        df['mdot'] = np.log10(df['Q_radius_old']*(df['radius'])**(3./2.))
-
-        df['q0'] = 10**df['logq0']
-        df['logQ0'] = np.log10(df['q0']*4*np.pi*(rsun*df['radius'])**2)
-        df['q1'] = 10**df['logq1']
-        df['logQ1'] = np.log10(df['q1']*4*np.pi*(rsun*df['radius'])**2)
-        df['q2'] = 10**df['logq2']
-        df['logQ2'] = np.log10(df['q2']*4*np.pi*(rsun*df['radius'])**2)
-
-        with open(radcorrfile, 'w') as f:
-            f.write('# Radius corretion (= corrected radius/estimated radius\n')
-            f.write(str(radius_ratio) + '\n')
-
-    else:
-        print("WARNING! No radius correction done. ")
-
-    return df, the_best_indat
-
-def get_uncertainties(df, dof_tot, npspec, param_names, param_space,
-    deriv_pars, incl_deriv=True):
-
-    if np.min(df['rchi2']) > RMSEA_THRESHOLD:
+    best_rchi2 = best_model.fitting_params['rchi2']
+    if best_rchi2 > RMSEA_THRESHOLD:
         which_statistic = 'RMSEA' # 'Pval_chi2' or 'Pval_ncchi2' or 'RMSEA'
     else:
         which_statistic = 'Pval_chi2'
 
-    # Assign P-vaues and compute inverse reduced chi2
-    df['invrchi2'] = 1./df['rchi2']
-    df['norm_rchi2'] = df['rchi2']/np.min(df['rchi2'])
-
-    df['RMSEA'] = np.sqrt((df['chi2']-dof_tot)/(dof_tot*(npspec-1)))
-    minRMSEA = np.min(df['RMSEA'])
+    best_model.fitting_params['RMSEA'] = np.sqrt(
+        (best_model.fitting_params['chi2'] - best_model.fitting_params['dof']) / (
+                    best_model.fitting_params['dof'] * (npspec - 1)))
+    minRMSEA = best_model.fitting_params['RMSEA']
     # closefit_RMSEA = minRMSEA + 0.005
     closefit_RMSEA = minRMSEA
-    lambda_nc = (closefit_RMSEA)**2 * dof_tot*(npspec-1)
+    lambda_nc = (closefit_RMSEA) ** 2 * best_model.fitting_params['dof'] * (npspec - 1)
 
-    if which_statistic == 'Pval_ncchi2':
-        df['P-value'] = calculateP_noncent(df['chi2'], dof_tot, lambda_nc)
-    else:
-        # ORIGINAL P-VALUE
-        df['P-value'] = calculateP(df['chi2'], dof_tot, normalize=True)
-
-    # Store the best fit parameters and 1 and 2 sig uncertainties in a dict
-    params_error_1sig = {}
-    params_error_2sig = {}
-
-    xbest = pd.Series.idxmin(df['rchi2'])
-    best_model_name = df['run_id'][xbest]
-    best_gen_name = best_model_name.split('_')[0]
-
+    min_p_1sig = 0.0
+    min_p_2sig = 0.0
     if which_statistic in ('Pval_ncchi2', 'Pval_chi2'):
         min_p_1sig = 0.317
         min_p_2sig = 0.0455
-        ind_1sig = df['P-value'] >= min_p_1sig
-        ind_2sig = df['P-value'] >= min_p_2sig
     elif which_statistic == 'RMSEA':
-        min_p_1sig = minRMSEA*1.04
-        min_p_2sig = minRMSEA*1.09
-        ind_1sig = df['RMSEA'] <= min_p_1sig
-        ind_2sig = df['RMSEA'] <= min_p_2sig
+        min_p_1sig = minRMSEA * 1.04
+        min_p_2sig = minRMSEA * 1.09
 
-    for i, aspace in zip(param_names, param_space):
-        the_step_size = aspace[2]
-        params_error_1sig[i] = [min(df[i][ind_1sig])-the_step_size,
-            max(df[i][ind_1sig])+the_step_size, df[i][xbest]]
-        params_error_2sig[i] = [min(df[i][ind_2sig])-the_step_size,
-            max(df[i][ind_2sig])+the_step_size, df[i][xbest]]
+    ind_1sig: list[pop.Individual] = []
+    ind_2sig: list[pop.Individual] = []
+    for generation in populations:
+        for ind in generation.population:
+            # Assign P-vaues and compute inverse reduced chi2
+            ind.fitting_params['invrchi2'] = 1./ind.fitting_params['rchi2']
+            ind.fitting_params['norm_rchi2'] = ind.fitting_params['rchi2']/best_rchi2
+
+            ind.fitting_params['RMSEA'] = np.sqrt((ind.fitting_params['chi2']-ind.fitting_params['dof'])/(ind.fitting_params['dof']*(npspec-1)))
+
+            if which_statistic == 'Pval_ncchi2':
+                ind.fitting_params['P-value'] = calculateP_noncent(ind.fitting_params['chi2'], ind.fitting_params['dof'], lambda_nc)
+            else:
+                # ORIGINAL P-VALUE
+                ind.fitting_params['P-value'] = calculateP(ind.fitting_params['chi2'], best_model.fitting_params['chi2'], ind.fitting_params['dof'], normalize=True)
+
+            if which_statistic == 'RMSEA':
+                if ind.fitting_params['RMSEA'] <= min_p_1sig:
+                    ind_1sig.append(ind)
+                if ind.fitting_params['RMSEA'] <= min_p_2sig:
+                    ind_2sig.append(ind)
+            else:
+                if ind.fitting_params['P-value'] >= min_p_1sig:
+                    ind_1sig.append(ind)
+                if ind.fitting_params['P-value'] >= min_p_2sig:
+                    ind_2sig.append(ind)
+
+
+    # Store the best fit parameters and 1 and 2 sig uncertainties in a dict
+    # shape of the resulting data:
+    #[{param1: [low, up, val], param2: [low, up, val], ...}, {param1: [low, up, val], param2: [low, up, val], ...}, ...]
+    errors_1sig = []
+    errors_2sig = []
+    for comp_idx in range(len(paramspaces)):
+        params_error_1sig = {}
+        params_error_2sig = {}
+        for key, value in paramspaces[comp_idx].variables.items():
+            the_step_size = float(value[2])
+            params_1sig = []
+            params_2sig = []
+            for ind in ind_1sig:
+                params_1sig.append(ind.components[comp_idx].parameters[key])
+            for ind in ind_2sig:
+                params_2sig.append(ind.components[comp_idx].parameters[key])
+            params_error_1sig[key] = [min(params_1sig)-the_step_size,
+                                      max(params_1sig)+the_step_size,
+                                      best_model.components[comp_idx].parameters[key]]
+            params_error_2sig[key] = [min(params_2sig)-the_step_size,
+                                      max(params_2sig)+the_step_size,
+                                      best_model.components[comp_idx].parameters[key]]
+        errors_1sig.append(params_error_1sig)
+        errors_2sig.append(params_error_2sig)
     if incl_deriv:
-        deriv_params_error_1sig = {}
-        deriv_params_error_2sig = {}
-        for i in (deriv_pars):
-            deriv_params_error_1sig[i] = [min(df[i][ind_1sig]),
-                max(df[i][ind_1sig]), df[i][xbest]]
-            deriv_params_error_2sig[i] = [min(df[i][ind_2sig]),
-                max(df[i][ind_2sig]), df[i][xbest]]
+        deriv_errors_1sig = []
+        deriv_errors_2sig = []
+        for comp_idx in range(len(paramspaces)):
+            deriv_params_error_1sig = {}
+            deriv_params_error_2sig = {}
+            for key in deriv_pars[comp_idx]:
+                params_1sig = []
+                params_2sig = []
+                for ind in ind_1sig:
+                    params_1sig.append(ind.components[comp_idx].parameters[key])
+                for ind in ind_2sig:
+                    params_2sig.append(ind.components[comp_idx].parameters[key])
+                deriv_params_error_1sig[key] = [float(min(params_1sig)),
+                                                float(max(params_1sig)),
+                                                float(best_model.components[comp_idx].parameters[key])]
+                deriv_params_error_2sig[key] = [float(min(params_2sig)),
+                                                float(max(params_2sig)),
+                                                float(best_model.components[comp_idx].parameters[key])]
+            deriv_errors_1sig.append(deriv_params_error_1sig)
+            deriv_errors_2sig.append(deriv_params_error_2sig)
 
     # Read best model names (for plotting of line profiles)
-    bestfamily_name = df['run_id'][ind_2sig].values
+    bestfamily = ind_2sig
 
-    n1sig = len(df['run_id'][ind_1sig].values)
-    n2sig = len(df['run_id'][ind_2sig].values)
+    n1sig = len(ind_1sig)
+    n2sig = len(ind_2sig)
 
     if incl_deriv:
-        best_uncertainty = (best_model_name, bestfamily_name, params_error_1sig,
-            params_error_2sig, deriv_params_error_1sig, deriv_params_error_2sig,
+        best_uncertainty = (best_model, bestfamily, errors_1sig,
+            errors_2sig, deriv_errors_1sig, deriv_errors_2sig,
             which_statistic)
     else:
-        best_uncertainty = (best_model_name, bestfamily_name, params_error_1sig,
-            params_error_2sig, which_statistic)
+        best_uncertainty = (best_model, bestfamily, errors_1sig,
+            errors_2sig, which_statistic)
 
-    return df,best_uncertainty, n1sig, n2sig
+    return best_uncertainty, n1sig, n2sig
+
+def get_local_uncertainties(generation: pop.Population, npspec, paramspaces: list[pop.Template], deriv_pars, best_so_far, incl_deriv=True):
+
+    best_model = best_so_far
+    best_rchi2 = best_model.fitting_params['rchi2']
+    for ind in generation.population:
+        if ind.fitting_params['rchi2'] <= best_rchi2:
+            best_model = ind
+            best_rchi2 = ind.fitting_params['rchi2']
+
+    if best_rchi2 > RMSEA_THRESHOLD:
+        which_statistic = 'RMSEA' # 'Pval_chi2' or 'Pval_ncchi2' or 'RMSEA'
+    else:
+        which_statistic = 'Pval_chi2'
+    best_model.fitting_params['RMSEA'] = np.sqrt(
+        (best_model.fitting_params['chi2'] - best_model.fitting_params['dof']) / (
+                    best_model.fitting_params['dof'] * (npspec - 1)))
+    minRMSEA = best_model.fitting_params['RMSEA']
+    # closefit_RMSEA = minRMSEA + 0.005
+    closefit_RMSEA = minRMSEA
+    lambda_nc = (closefit_RMSEA) ** 2 * best_model.fitting_params['dof'] * (npspec - 1)
+
+    min_p_1sig = 0.0
+    min_p_2sig = 0.0
+    if which_statistic in ('Pval_ncchi2', 'Pval_chi2'):
+        min_p_1sig = 0.317
+        min_p_2sig = 0.0455
+    elif which_statistic == 'RMSEA':
+        min_p_1sig = minRMSEA * 1.04
+        min_p_2sig = minRMSEA * 1.09
+
+    ind_1sig: list[pop.Individual] = []
+    ind_2sig: list[pop.Individual] = []
+    if best_model == best_so_far:
+        ind_1sig.append(best_model)
+        ind_2sig.append(best_model)
+    for ind in generation.population:
+        # Assign P-vaues and compute inverse reduced chi2
+        ind.fitting_params['invrchi2'] = 1./ind.fitting_params['rchi2']
+        ind.fitting_params['norm_rchi2'] = ind.fitting_params['rchi2']/best_rchi2
+
+        ind.fitting_params['RMSEA'] = np.sqrt((ind.fitting_params['chi2']-ind.fitting_params['dof'])/(ind.fitting_params['dof']*(npspec-1)))
+
+        if which_statistic == 'Pval_ncchi2':
+            ind.fitting_params['P-value'] = calculateP_noncent(ind.fitting_params['chi2'], ind.fitting_params['dof'], lambda_nc)
+        else:
+            # ORIGINAL P-VALUE
+            ind.fitting_params['P-value'] = calculateP(ind.fitting_params['chi2'], best_model.fitting_params['chi2'], ind.fitting_params['dof'], normalize=True)
+
+        if which_statistic == 'RMSEA':
+            if ind.fitting_params['RMSEA'] <= min_p_1sig:
+                ind_1sig.append(ind)
+            if ind.fitting_params['RMSEA'] <= min_p_2sig:
+                ind_2sig.append(ind)
+        else:
+            if ind.fitting_params['P-value'] >= min_p_1sig:
+                ind_1sig.append(ind)
+            if ind.fitting_params['P-value'] >= min_p_2sig:
+                ind_2sig.append(ind)
+
+    # Store the best fit parameters and 1 and 2 sig uncertainties in a dict
+    # shape of the resulting data:
+    #[{param1: [low, up, val], param2: [low, up, val], ...}, {param1: [low, up, val], param2: [low, up, val], ...}, ...]
+    errors_1sig = []
+    errors_2sig = []
+    for comp_idx in range(len(paramspaces)):
+        params_error_1sig = {}
+        params_error_2sig = {}
+        for key, value in paramspaces[comp_idx].variables.items():
+            the_step_size = float(value[2])
+            params_1sig = []
+            params_2sig = []
+            for ind in ind_1sig:
+                params_1sig.append(ind.components[comp_idx].parameters[key])
+            for ind in ind_2sig:
+                params_2sig.append(ind.components[comp_idx].parameters[key])
+            if params_1sig:
+                params_error_1sig[key] = [min(params_1sig)-the_step_size,
+                                          max(params_1sig)+the_step_size,
+                                          best_model.components[comp_idx].parameters[key]]
+                params_error_2sig[key] = [min(params_2sig)-the_step_size,
+                                          max(params_2sig)+the_step_size,
+                                          best_model.components[comp_idx].parameters[key]]
+            else:
+                params_error_1sig[key] = [0, 0, 0]
+                params_error_2sig[key] = [0, 0, 0]
+        errors_1sig.append(params_error_1sig)
+        errors_2sig.append(params_error_2sig)
+    if incl_deriv:
+        deriv_errors_1sig = []
+        deriv_errors_2sig = []
+        for comp_idx in range(len(paramspaces)):
+            deriv_params_error_1sig = {}
+            deriv_params_error_2sig = {}
+            for key in deriv_pars[comp_idx]:
+                params_1sig = []
+                params_2sig = []
+                for ind in ind_1sig:
+                    params_1sig.append(ind.components[comp_idx].parameters[key])
+                for ind in ind_2sig:
+                    params_2sig.append(ind.components[comp_idx].parameters[key])
+                deriv_params_error_1sig[key] = [float(min(params_1sig)),
+                                                float(max(params_1sig)),
+                                                float(best_model.components[comp_idx].parameters[key])]
+                deriv_params_error_2sig[key] = [float(min(params_2sig)),
+                                                float(max(params_2sig)),
+                                                float(best_model.components[comp_idx].parameters[key])]
+            deriv_errors_1sig.append(deriv_params_error_1sig)
+            deriv_errors_2sig.append(deriv_params_error_2sig)
+
+    # Read best model names (for plotting of line profiles)
+    bestfamily = ind_2sig
+
+    n1sig = len(ind_1sig)
+    n2sig = len(ind_2sig)
+
+    if incl_deriv:
+        best_uncertainty = (best_model, bestfamily, errors_1sig,
+            errors_2sig, deriv_errors_1sig, deriv_errors_2sig,
+            which_statistic)
+    else:
+        best_uncertainty = (best_model, bestfamily, errors_1sig,
+            errors_2sig, which_statistic)
+
+    return best_uncertainty, n1sig, n2sig
 
 
 def propagate_uncertainty(value_dict, param_name, radius, delta_radius, power,
@@ -639,9 +805,11 @@ def propagate_uncertainty(value_dict, param_name, radius, delta_radius, power,
     return value_dict
 
 
+#not currently implemented
 def add_anchor_magnitude_uncertainty(df, runname, best_uncertainty,
                                      fw_path, theradiusfile):
     """
+    not currently implemented
     Adds the uncertainty from the error in the absolute magnitude. The error is
     taken from the lum_anchor_update file. Performs error propagation to all
     relevant parameters.
@@ -685,15 +853,15 @@ def add_anchor_magnitude_uncertainty(df, runname, best_uncertainty,
     else:
         print("No SED for radius correction found, using approximation")
         new_rad = m2r.magnitude_to_radius(df['teff'][xbest],
-                                          m_name, m_value, m_system)
+                                          m_name, m_value, m_system)[0]
         max_rad1 = m2r.magnitude_to_radius(df['teff'][xbest],
-                                          m_name, m_value - m_error, m_system)
+                                          m_name, m_value - m_error, m_system)[0]
         max_rad2 = m2r.magnitude_to_radius(df['teff'][xbest],
-                                          m_name, m_value - 2*m_error, m_system)
+                                          m_name, m_value - 2*m_error, m_system)[0]
         min_rad1 = m2r.magnitude_to_radius(df['teff'][xbest],
-                                          m_name, m_value + m_error, m_system)
+                                          m_name, m_value + m_error, m_system)[0]
         min_rad2 = m2r.magnitude_to_radius(df['teff'][xbest],
-                                          m_name, m_value + 2*m_error, m_system)
+                                          m_name, m_value + 2*m_error, m_system)[0]
 
     delta_radius1 = (max_rad1 - min_rad1) * 0.5
     delta_radius2 = (max_rad2 - min_rad2) * 0.5
@@ -733,9 +901,9 @@ def add_anchor_magnitude_uncertainty(df, runname, best_uncertainty,
     return best_model_name, bestfamily_name, pars_err1, pars_err2, d_pars_err1,\
         d_pars_err2, which_statistic
 
-def titlepage(df, runname, params_error_1sig, params_error_2sig,
-    the_pdf, param_names, maxgen, nind, linedct, which_sigma,
-    deriv_params_error_1sig, deriv_params_error_2sig, deriv_pars):
+def titlepage(df, best_model: pop.Individual, runname, params_error_1sig, params_error_2sig,
+    the_pdf, maxgen, nind, spectra: list[Epoch], which_sigma,
+    deriv_params_error_1sig, deriv_params_error_2sig, deriv_pars: list[set[str]]):
     """
     Make a page with best fit parameters and errors
     """
@@ -743,11 +911,13 @@ def titlepage(df, runname, params_error_1sig, params_error_2sig,
     ncrash = len(df.copy()[df['chi2'] == 999999999])
     ntot = len(df)
     perccrash = round(100.0*ncrash/ntot,1)
-    minrchi2 = round(np.min(df['rchi2']),2)
-    nlines = len(linedct['name'])
+    minrchi2 = best_model.fitting_params['rchi2']
+    nlines = len(spectra[0].get_line_names())
+    nEpochs = len(spectra)
+    multiplicity = len(best_model.components)
 
-    fig, ax = plt.subplots(2,2,figsize=(12.5, 12.5),
-        gridspec_kw={'height_ratios': [0.5, 3], 'width_ratios': [2, 8]})
+    fig, ax = plt.subplots(multiplicity + 1,2,figsize=(12.5, 6.5 + 6*multiplicity),
+        gridspec_kw={'height_ratios': [0.5] + [3]*multiplicity, 'width_ratios': [2, 8]})
 
     # Not catch all, but catch most solution
     path_to_ga = sys.argv[0].strip("GA_analysis.py")
@@ -756,12 +926,11 @@ def titlepage(df, runname, params_error_1sig, params_error_2sig,
 
     ax[0,0].axis('off')
     ax[0,1].axis('off')
-    ax[1,0].axis('off')
-    ax[1,1].axis('off')
+
 
     boldtext = {'ha':'left', 'va':'top', 'weight':'bold'}
     normtext = {'ha':'left', 'va':'top'}
-    offs = 0.12
+    offs = 0.1
     yvalmax = 0.9
     ax[0,1].text(0.0, yvalmax, 'Run name', **boldtext)
     ax[0,1].text(0.25, yvalmax, runname, **normtext)
@@ -777,6 +946,10 @@ def titlepage(df, runname, params_error_1sig, params_error_2sig,
     ax[0,1].text(0.25, yvalmax-5*offs, str(perccrash) + '%', **normtext)
     ax[0,1].text(0.0, yvalmax-6*offs, 'Number of lines', **boldtext)
     ax[0,1].text(0.25, yvalmax-6*offs, str(nlines), **normtext)
+    ax[0, 1].text(0.0, yvalmax - 7 * offs, 'Number of Epochs', **boldtext)
+    ax[0, 1].text(0.25, yvalmax - 7 * offs, str(nEpochs), **normtext)
+    ax[0, 1].text(0.0, yvalmax - 8 * offs, 'Multiplicity', **boldtext)
+    ax[0, 1].text(0.25, yvalmax - 8 * offs, str(multiplicity), **normtext)
 
     if which_sigma == 2:
         psig = params_error_2sig
@@ -785,47 +958,54 @@ def titlepage(df, runname, params_error_1sig, params_error_2sig,
         psig = params_error_1sig
         deriv_psig = deriv_params_error_1sig
 
-    offs = 0.02
-    yvalmax = 1.0
-    secndcol = 0.15
-    ax[1,1].text(0.0, yvalmax, 'Parameter', weight='bold')
-    ax[1,1].text(secndcol, yvalmax, 'Best', weight='bold')
-    ax[1,1].text(secndcol*2, yvalmax, '-' + str(which_sigma)
-        + r'$\mathbf{\sigma}$', weight='bold')
-    ax[1,1].text(secndcol*3, yvalmax, '+' + str(which_sigma)
-        + r'$\mathbf{\sigma}$', weight='bold')
-    ax[1,1].text(secndcol*4, yvalmax,
-        r'Min (' + str(which_sigma) + r'$\mathbf{\sigma}$)', weight='bold')
-    ax[1,1].text(secndcol*5, yvalmax,
-        r'Max (' + str(which_sigma) + r'$\mathbf{\sigma}$)', weight='bold')
-    for paramname in param_names:
-        yvalmax = yvalmax - offs
-        ax[1,1].text(0.0, yvalmax, paramname)
-        ax[1,1].text(secndcol, yvalmax,
-            round(psig[paramname][2],3))
-        ax[1,1].text(secndcol*2, yvalmax,
-            round(psig[paramname][2]-psig[paramname][0],3))
-        ax[1,1].text(secndcol*3, yvalmax,
-            round(psig[paramname][1]-psig[paramname][2],3))
-        ax[1,1].text(secndcol*4, yvalmax,
-            round(psig[paramname][0],3))
-        ax[1,1].text(secndcol*5, yvalmax,
-            round(psig[paramname][1],3))
 
-    yvalmax = yvalmax - offs
-    for paramname in deriv_pars:
+
+    for i in range(multiplicity):
+        offs = 0.02
+        yvalmax = 1.0
+        secndcol = 0.15
+        fig_i = i+1
+        ax[fig_i,0].axis('off')
+        ax[fig_i,1].axis('off')
+        ax[fig_i,0].text(0.0, yvalmax, 'Component: ' + str(i), **boldtext)
+        ax[fig_i,1].text(0.0, yvalmax, 'Parameter', weight='bold')
+        ax[fig_i,1].text(secndcol, yvalmax, 'Best', weight='bold')
+        ax[fig_i,1].text(secndcol*2, yvalmax, '-' + str(which_sigma)
+            + r'$\mathbf{\sigma}$', weight='bold')
+        ax[fig_i,1].text(secndcol*3, yvalmax, '+' + str(which_sigma)
+            + r'$\mathbf{\sigma}$', weight='bold')
+        ax[fig_i,1].text(secndcol*4, yvalmax,
+            r'Min (' + str(which_sigma) + r'$\mathbf{\sigma}$)', weight='bold')
+        ax[fig_i,1].text(secndcol*5, yvalmax,
+            r'Max (' + str(which_sigma) + r'$\mathbf{\sigma}$)', weight='bold')
+        for param in best_model.components[i].template.variables.keys():
+            yvalmax = yvalmax - offs
+            ax[fig_i,1].text(0.0, yvalmax, param)
+            ax[fig_i,1].text(secndcol, yvalmax,
+                round(psig[i][param][2],3))
+            ax[fig_i,1].text(secndcol*2, yvalmax,
+                round(psig[i][param][2]-psig[i][param][0],3))
+            ax[fig_i,1].text(secndcol*3, yvalmax,
+                round(psig[i][param][1]-psig[i][param][2],3))
+            ax[fig_i,1].text(secndcol*4, yvalmax,
+                round(psig[i][param][0],3))
+            ax[fig_i,1].text(secndcol*5, yvalmax,
+                round(psig[i][param][1],3))
+
         yvalmax = yvalmax - offs
-        ax[1,1].text(0.0, yvalmax, paramname)
-        ax[1,1].text(secndcol, yvalmax,
-            round(deriv_psig[paramname][2],3))
-        ax[1,1].text(secndcol*2, yvalmax,
-            round(deriv_psig[paramname][2]-deriv_psig[paramname][0],3))
-        ax[1,1].text(secndcol*3, yvalmax,
-            round(deriv_psig[paramname][1]-deriv_psig[paramname][2],3))
-        ax[1,1].text(secndcol*4, yvalmax,
-            round(deriv_psig[paramname][0],3))
-        ax[1,1].text(secndcol*5, yvalmax,
-            round(deriv_psig[paramname][1],3))
+        for paramname in deriv_pars[i]:
+            yvalmax = yvalmax - offs
+            ax[fig_i,1].text(0.0, yvalmax, paramname)
+            ax[fig_i,1].text(secndcol, yvalmax,
+                round(deriv_psig[i][paramname][2],3))
+            ax[fig_i,1].text(secndcol*2, yvalmax,
+                round(deriv_psig[i][paramname][2]-deriv_psig[i][paramname][0],3))
+            ax[fig_i,1].text(secndcol*3, yvalmax,
+                round(deriv_psig[i][paramname][1]-deriv_psig[i][paramname][2],3))
+            ax[fig_i,1].text(secndcol*4, yvalmax,
+                round(deriv_psig[i][paramname][0],3))
+            ax[fig_i,1].text(secndcol*5, yvalmax,
+                round(deriv_psig[i][paramname][1],3))
 
     plt.tight_layout()
     the_pdf.savefig(dpi=150)
@@ -937,19 +1117,58 @@ def fix_latex(string):
     string = string.replace("_", " ")
     return string
 
+def remove_outliers_iqr(df, column, k=1.3):
+    if column not in df.columns:
+        return df
+    q1 = df[column].quantile(0.25)
+    q3 = df[column].quantile(0.75)
+    iqr = q3 - q1
+
+    lower = q1 - k * iqr
+    upper = q3 + k * iqr
+
+    mask = (df[column] >= lower) & (df[column] <= upper)
+    return df[mask]
+
+def get_relevant_param_df(populations: list[pop.Population], best_ind: pop.Individual, comp):
+    fit_keys = list(best_ind.fitting_params.keys())
+    comp_keys = list(best_ind.components[comp].parameters.keys())
+
+    columns = ['gen'] + fit_keys + comp_keys
+    rows = []
+
+    for generation in populations:
+        gen_id = int(generation.name)
+
+        for ind in generation.population:
+            fit_params = ind.fitting_params
+
+            if fit_params['rchi2'] < 99999999:
+                comp_params = ind.components[comp].parameters
+
+                row = [gen_id]
+                row.extend(fit_params[k] for k in fit_keys)
+                row.extend(comp_params[k] for k in comp_keys)
+
+                rows.append(row)
+
+    param_values = pd.DataFrame(rows, columns=columns)
+
+    # Outlier filtering
+    for par in best_ind.components[comp].vrads.keys():
+        param_values = remove_outliers_iqr(param_values, par)
+
+    return param_values
+
 
 def fitnessplot(df, yval, params_error_1sig, params_error_2sig,
-    the_pdf, param_names, param_space, maxgen,
-    which_cmap=plt.cm.viridis, save_jpg=False, df_tot=[]):
+    the_pdf, maxgen, param_names: list[str], which_cmap=plt.cm.viridis, save_jpg=False):
 
     """
     Plot the fitness as a function of each free parameter. This function
     can be used for plotting the P-value, 1/rchi2 of all lines combined,
     or for the fitness of individual lines (1/rchi2)
     """
-
-    # Only consider models that have not crashed
-    df = df[df['chi2'] < 999999999]
 
     # Prepare colorbar
     cmap = which_cmap
@@ -970,7 +1189,6 @@ def fitnessplot(df, yval, params_error_1sig, params_error_2sig,
 
     # Loop through parameters
     for i in range(ncols*nrows):
-
         if ccol == ncols - 1:
             ccol = 0
             crow = crow + 1
@@ -980,23 +1198,20 @@ def fitnessplot(df, yval, params_error_1sig, params_error_2sig,
         if i >= len(param_names):
             ax[crow,ccol].axis('off')
             continue
-
+        param = param_names[i]
         # Make actual plots
-        ax[crow,ccol].set_title(param_names[i])
-        if len(param_space) > 0:
-            ax[crow,ccol].set_xlim(param_space[i][0], param_space[i][1])
-        elif param_names[i] == 'Gamma_Edd':
+        ax[crow,ccol].set_title(param)
+        if param == 'Gamma_Edd':
             ax[crow,ccol].set_xlim(0,1.0)
-        elif param_names[i] == 'vinf_vesc':
+        elif param == 'vinf_vesc':
             ax[crow,ccol].set_xlim(0,10.0)
-        scat0 = ax[crow,ccol].scatter(df[param_names[i]], df[yval],
-            c=df['gen'], cmap=cmap, norm=norm, s=10)
+        scat0 = ax[crow,ccol].scatter(df[param], df[yval], c=df['gen'], cmap=cmap, norm=norm, s=10)
 
-        min1sig = params_error_1sig[param_names[i]][0]
-        max1sig = params_error_1sig[param_names[i]][1]
-        min2sig = params_error_2sig[param_names[i]][0]
-        max2sig = params_error_2sig[param_names[i]][1]
-        bestfit = params_error_2sig[param_names[i]][2]
+        min1sig = params_error_1sig[param][0]
+        max1sig = params_error_1sig[param][1]
+        min2sig = params_error_2sig[param][0]
+        max2sig = params_error_2sig[param][1]
+        bestfit = params_error_2sig[param][2]
         # if not save_jpg:
         ax[crow,ccol].axvline(bestfit, color='orangered', lw=1.5)
         ax[crow,ccol].axvspan(min1sig, max1sig, color='gold',
@@ -1014,12 +1229,7 @@ def fitnessplot(df, yval, params_error_1sig, params_error_2sig,
             else:
                 ax[crow,ccol].set_ylabel(r'1/$\chi^2_{\rm red}$')
 
-        if len(df_tot) > 0:
-            ax[crow,ccol].set_ylim(-0.05*np.max(df_tot[yval]),
-                np.max(df_tot[yval])*1.10)
-        else:
-            ax[crow,ccol].set_ylim(-0.05*np.max(df[yval]),
-                np.max(df[yval])*1.10)
+        ax[crow,ccol].set_ylim(-0.05*max(df[yval]), max(df[yval])*1.10)
 
     # Colorbar
     cbar = plt.colorbar(scat0, orientation='horizontal', ax=ax[-1,-1])
@@ -1027,15 +1237,9 @@ def fitnessplot(df, yval, params_error_1sig, params_error_2sig,
 
     # Set title
     if yval in ('invrchi2', 'P-value'):
-        if len(param_space) > 0:
-            plt.suptitle('All lines')
-        else:
-            plt.suptitle('All lines (derived parameters)')
+        plt.suptitle('All lines (derived parameters)')
     else:
-        if len(param_space) > 0:
-            plt.suptitle(yval)
-        else:
-            plt.suptitle(yval + ' (derived parameters)')
+        plt.suptitle(yval)
 
     # Tight layout and save plot
     plt.tight_layout()
@@ -1055,9 +1259,8 @@ def fitnessplot(df, yval, params_error_1sig, params_error_2sig,
         return fig, ax
 
 
-def fitnessplot_per_parameter(df, xval, params_error_1sig, params_error_2sig,
-    the_pdf, line_names, param_space, maxgen,
-    which_cmap=plt.cm.viridis, save_jpg=False, df_tot=[]):
+def fitnessplot_per_parameter(df, yval, params_error_1sig, params_error_2sig,
+    the_pdf, maxgen, param_names: list[str], which_cmap=plt.cm.viridis, save_jpg=False):
 
     """
     Plot the fitness as a function for each line for a given free parameter.
@@ -1067,114 +1270,76 @@ def fitnessplot_per_parameter(df, xval, params_error_1sig, params_error_2sig,
     and the sample density.
     """
 
-    # Only consider models that have not crashed
-    df_crash = df[df['chi2'] == 999999999]
-    df = df[df['chi2'] < 999999999]
-
     # Prepare colorbar
     cmap = which_cmap
-    bounds = np.linspace(0, maxgen+1, maxgen+2)
-    norm = matplotlib.colors.BoundaryNorm(bounds, int(cmap.N*0.8))
+    bounds = np.linspace(0, maxgen + 1, maxgen + 2)
+    norm = matplotlib.colors.BoundaryNorm(bounds, int(cmap.N * 0.8))
 
-    # Determine the colors of the stacked histogram.
-    scalarmap = matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis")
-    scalarmap._A = []
-    colors = [scalarmap.to_rgba(gen) for gen in range(maxgen)]
-
-    line_names = ["invrchi2"] + list(line_names) + [xval]
     # Set up figure dimensions and subplots
     ncols = 5
     # nrows len(param_names)+1 to ensure space for the colorbar
-    nrows =int(math.ceil(1.0*(len(line_names)+1)/ncols))
-    nrows =max(nrows, 2)
+    nrows = int(math.ceil(1.0 * (len(param_names) + 1) / ncols))
+    nrows = max(nrows, 2)
     ccol = ncols - 1
     crow = -1
     figsizefact = 2.5
     fig, ax = plt.subplots(nrows, ncols,
-        figsize=(figsizefact*ncols, figsizefact*nrows), sharey=False)
+                           figsize=(figsizefact * ncols, figsizefact * nrows),
+                           sharey=True)
 
-    # Loop through lines
-    for i in range(ncols*nrows):
-
+    # Loop through parameters
+    for i in range(ncols * nrows):
         if ccol == ncols - 1:
             ccol = 0
             crow = crow + 1
         else:
             ccol = ccol + 1
 
-        if i >= (len(line_names)):
-            ax[crow,ccol].axis('off')
+        if i >= len(param_names):
+            ax[crow, ccol].axis('off')
             continue
-
+        param = param_names[i]
         # Make actual plots
-        if line_names[i] == "invrchi2":
-            ax[crow,ccol].set_title("All lines")
-        elif line_names[i] == xval:
-            ax[crow,ccol].set_title("Sample density")
-        else:
-            ax[crow,ccol].set_title(line_names[i])
-        if len(param_space) > 0:
-            ax[crow,ccol].set_xlim(param_space[0], param_space[1])
+        ax[crow, ccol].set_title(param)
+        if param == 'Gamma_Edd':
+            ax[crow, ccol].set_xlim(0, 1.0)
+        elif param == 'vinf_vesc':
+            ax[crow, ccol].set_xlim(0, 10.0)
+        scat0 = ax[crow, ccol].scatter(df[yval], df[param], c=df['gen'], cmap=cmap, norm=norm, s=10)
 
-        if xval != line_names[i]:
-            scat0 = ax[crow,ccol].scatter(df[xval], df[line_names[i]],
-                c=df['gen'], cmap=cmap, norm=norm, s=10)
-            df_tmp_best = df.copy().sort_values(by=[line_names[i]],
-                ascending=False)
-            thebestval = df_tmp_best[xval].iloc[0]
-            ax[crow,ccol].text(0.95, 0.95,thebestval,
-                ha='right', va='top', transform=ax[crow,ccol].transAxes)
-        else:
-            bins = np.arange(param_space[0] - 0.5 * param_space[2],
-                             param_space[1] + 0.5 * param_space[2],
-                             param_space[2])
-            hist_data = [df[xval][df['gen'] == i] for i in range(maxgen)]
-            ax[crow,ccol].hist(hist_data, bins=bins, density=True, color=colors,
-                               stacked=True)
-            ax[crow,ccol].hist(df_crash[xval], histtype="step", color="red",
-                               density=True, bins=bins)
-
-        min1sig = params_error_1sig[xval][0]
-        max1sig = params_error_1sig[xval][1]
-        min2sig = params_error_2sig[xval][0]
-        max2sig = params_error_2sig[xval][1]
-        bestfit = params_error_2sig[xval][2]
-
-        ax[crow,ccol].axvline(bestfit, color='orangered', lw=1.5)
-        ax[crow,ccol].axvspan(min1sig, max1sig, color='gold',
-            alpha=0.70, zorder=0)
-        ax[crow,ccol].axvspan(min2sig, max2sig, color='gold',
-            alpha=0.25, zorder=0)
+        min1sig = params_error_1sig[yval][0]
+        max1sig = params_error_1sig[yval][1]
+        min2sig = params_error_2sig[yval][0]
+        max2sig = params_error_2sig[yval][1]
+        bestfit = params_error_2sig[yval][2]
+        # if not save_jpg:
+        ax[crow, ccol].axvline(bestfit, color='orangered', lw=1.5)
+        ax[crow, ccol].axvspan(min1sig, max1sig, color='gold',
+                               alpha=0.70, zorder=0)
+        ax[crow, ccol].axvspan(min2sig, max2sig, color='gold',
+                               alpha=0.25, zorder=0)
+        ax[crow, ccol].set_rasterized(True)
 
         # Set y-labels
         if ccol == 0:
-            ax[crow,ccol].set_ylabel(r'1/$\chi^2_{\rm red}$')
-
-        if xval != line_names[i]:
-            if len(df_tot) > 0:
-                ax[crow,ccol].set_ylim(-0.05*np.max(df_tot[line_names[i]]),
-                    np.max(df_tot[line_names[i]])*1.10)
+            if yval == 'P-value':
+                ax[crow, ccol].set_ylabel('P-value')
+            elif yval == 'fitness':
+                ax[crow, ccol].set_ylabel('Fitness')
             else:
-                ax[crow,ccol].set_ylim(-0.05*np.max(df[line_names[i]]),
-                    np.max(df[line_names[i]])*1.10)
-        ax[crow, ccol].set_rasterized(True)
+                ax[crow, ccol].set_ylabel(r'1/$\chi^2_{\rm red}$')
 
+        ax[crow, ccol].set_ylim(-0.05 * max(df[param]), max(df[param]) * 1.10)
 
     # Colorbar
-    cbar = plt.colorbar(scat0, orientation='horizontal', ax=ax[-1,-1])
+    cbar = plt.colorbar(scat0, orientation='horizontal', ax=ax[-1, -1])
     cbar.ax.set_title('Generation')
 
     # Set title
-    if xval in ('invrchi2', 'P-value'):
-        if len(param_space) > 0:
-            plt.suptitle('All lines')
-        else:
-            plt.suptitle('All lines (derived parameters)')
+    if yval in ('invrchi2', 'P-value'):
+        plt.suptitle('All lines (derived parameters)')
     else:
-        if len(param_space) > 0:
-            plt.suptitle(xval)
-        else:
-            plt.suptitle(xval + ' (derived parameters)')
+        plt.suptitle(yval)
 
     # Tight layout and save plot
     plt.tight_layout()
@@ -1182,37 +1347,83 @@ def fitnessplot_per_parameter(df, xval, params_error_1sig, params_error_2sig,
         plt.subplots_adjust(0.07, 0.07, 0.93, 0.85)
     else:
         plt.subplots_adjust(0.07, 0.07, 0.93, 0.90)
-
     if not save_jpg:
-        the_pdf.savefig(dpi=100)
-        plt.close("all")
+        if yval in ('invrchi2', 'P-value'):
+            the_pdf.savefig(dpi=150)
+        else:
+            the_pdf.savefig(dpi=100)
+        plt.close()
 
         return the_pdf
     else:
         return fig, ax
 
-def lineprofiles(df, spectdct, linedct, savedmoddir,
-    best_model_name, bestfamily_name, the_pdf, plotlineprofdir,
+
+
+def unpack_tarfiles(savedmoddir, comp, mod):
+    name = mod.name
+    moddir = savedmoddir + name.split('_')[0] + '/' + name.split('_')[1] + '/'
+    if not os.path.isdir(moddir + 'combined'):
+        fw.mkdir(moddir + 'combined')
+        fw.untar(moddir + 'combined.tar.gz', moddir + 'combined' + '/.')
+    if comp:
+        params = pd.read_csv(moddir + 'combined/params.csv')
+        for index, row in params.iterrows():
+            newloc = moddir + str(index) + '/'
+            name = row['run_id']
+            compparts = name.split('_')
+            compname = str(index)
+            if len(compparts) == 4:
+                compname += '_' + compparts[-1]
+            if not os.path.isdir(newloc):
+                fw.mkdir(newloc)
+                fw.untar(moddir + compname + '.tar.gz', newloc)
+
+
+def prep_plot_data(spectrum, best_mod_location, plotmoddirlist, plotlineprofdir, active_line):
+    # Read data per line
+    wave_tmp, flux_tmp, err_tmp = spectrum.get_line_data(active_line)
+
+    # Read profile of best fitting model
+    best_prof_file = best_mod_location + '/combined/profiles/' + active_line + '.prof.comb'
+    bestmodwave, bestmodflux = np.loadtxt(best_prof_file, unpack=True)
+
+    # Read profiles of best fitting family of models
+    lineflux_min = np.copy(bestmodflux)
+    lineflux_max = np.copy(bestmodflux)
+    if len(plotmoddirlist) > 0:
+        for asig_mod in plotmoddirlist:
+            fam_prof_file = os.path.join(asig_mod, active_line + '.prof.comb')
+            smwave, smflux = np.loadtxt(fam_prof_file, unpack=True)
+
+            np.minimum(lineflux_min, smflux, out=lineflux_min)
+            np.maximum(lineflux_max, smflux, out=lineflux_max)
+    lineprof_arr = np.array([bestmodwave, bestmodflux, lineflux_min,
+                             lineflux_max]).T
+    lineprof_arr_head = 'wave bestflux minflux maxflux'
+    np.savetxt(plotlineprofdir + active_line + '.txt', lineprof_arr,
+               header=lineprof_arr_head)
+
+    return wave_tmp, flux_tmp, err_tmp, bestmodwave, bestmodflux, lineflux_min, lineflux_max
+
+
+def lineprofiles(pool, spectrum: Epoch, savedmoddir,
+    best_mod_location, bestfamily, the_pdf, plotlineprofdir,
     extra_fwmod, extra_mod, save_jpg=False):
     """
     Create plot with line profiles of best fitting models.
     In the background, plot the data.
     """
-
-    nlines = len(linedct['name'])
+    active_lines = spectrum.get_active_lines()
+    nlines = len(active_lines)
 
     # Untar best fitting models.
     plotmoddirlist = []
-    for amod in bestfamily_name:
-        moddir = savedmoddir + amod.split('_')[0] + '/' + amod + '/'
-        modtar = savedmoddir + amod.split('_')[0] + '/' + amod + '.tar.gz'
-        if not os.path.isdir(moddir):
-            os.system('mkdir -p ' + moddir)
-            os.system('tar -xzf ' + modtar + ' -C ' + moddir + '/.')
-        plotmoddirlist.append(moddir)
-
-    bestmoddir = (savedmoddir + best_model_name.split('_')[0] +
-        '/' + best_model_name +  '/')
+    for mod in bestfamily:
+        name = mod.name
+        part1, part2 = name.split('_')[:2]
+        moddir = os.path.join(savedmoddir, part1, part2, 'combined')
+        plotmoddirlist.append(os.path.join(moddir, 'profiles'))
 
     # Set up figure dimensions and subplots
     ncols = 5
@@ -1224,9 +1435,11 @@ def lineprofiles(df, spectdct, linedct, savedmoddir,
     fig, ax = plt.subplots(nrows, ncols,
         figsize=(figsizefact*ncols, 0.7*figsizefact*nrows))
 
+    prep_data_func = functools.partial(prep_plot_data, spectrum, best_mod_location, plotmoddirlist, plotlineprofdir)
+    prep_data = pool.map(prep_data_func, active_lines)
+
     # Loop through parameters
     for i in range(ncols*nrows):
-
         if ccol == ncols - 1:
             ccol = 0
             crow = crow + 1
@@ -1237,36 +1450,12 @@ def lineprofiles(df, spectdct, linedct, savedmoddir,
             ax[crow,ccol].axis('off')
             continue
 
-        # Read data per line
-        keep_idx = [(spectdct['wave'] > linedct['left'][i]) &
-            (spectdct['wave'] < linedct['right'][i])]
-        wave_tmp = spectdct['wave'][tuple(keep_idx)]
-        flux_tmp = spectdct['flux'][tuple(keep_idx)]
-        err_tmp = spectdct['err'][tuple(keep_idx)]
+        active_line = active_lines[i]
 
-        # Read profile of best fitting model
-        best_prof_file = bestmoddir + linedct['name'][i] + '.prof.fin'
-        bestmodwave, bestmodflux = np.genfromtxt(best_prof_file).T
-
-        # Read profiles of best fitting family of models
-        lineflux_min = np.copy(bestmodflux)
-        lineflux_max = np.copy(bestmodflux)
-        if len(plotmoddirlist) > 0:
-            for asig_mod in plotmoddirlist:
-                fam_prof_file = asig_mod + linedct['name'][i] + '.prof.fin'
-                smwave, smflux = np.genfromtxt(fam_prof_file).T
-
-                lineflux_min = np.min(np.array([lineflux_min, smflux]), axis=0)
-                lineflux_max = np.max(np.array([lineflux_max, smflux]), axis=0)
-
-        lineprof_arr = np.array([bestmodwave, bestmodflux, lineflux_min,
-            lineflux_max]).T
-        lineprof_arr_head = 'wave bestflux minflux maxflux'
-        np.savetxt(plotlineprofdir + linedct['name'][i] + '.txt', lineprof_arr,
-            header=lineprof_arr_head)
+        wave_tmp, flux_tmp, err_tmp, bestmodwave, bestmodflux, lineflux_min, lineflux_max = prep_data[i]
 
         # Make actual plots
-        ax[crow,ccol].set_title(linedct['name'][i])
+        ax[crow,ccol].set_title(active_line)
         ax[crow,ccol].axhline(1.0, color='black', lw=0.8)
         ax[crow,ccol].errorbar(wave_tmp, flux_tmp, yerr=err_tmp,
             fmt='o', color='black', ms=0)
@@ -1274,16 +1463,16 @@ def lineprofiles(df, spectdct, linedct, savedmoddir,
             color='#8cd98c', alpha=0.7)
         ax[crow,ccol].plot(bestmodwave, bestmodflux, color='#1ca641', lw=2.4,
             alpha=1.0)
-        ax[crow,ccol].set_xlim(linedct['left'][i], linedct['right'][i])
+        #ax[crow,ccol].set_xlim(linedct['left'][i], linedct['right'][i])
         # ax[crow,ccol].set_ylim(*ax[crow,ccol].get_ylim())
         ax[crow,ccol].set_ylim(np.min([np.min(flux_tmp) * 0.95, np.min(lineflux_min) * 0.95]),
                                np.max([np.max(flux_tmp) * 1.05, np.max(lineflux_max) * 1.05]))
 
         # plot an extra fastwind model
         if not extra_fwmod == '/':
-            extramfile = extra_fwmod + linedct['name'][i] + '.prof'
+            extramfile = extra_fwmod + active_lines[i] + '.prof'
             if os.path.isfile(extramfile):
-                em_wave, em_flux = np.genfromtxt(extramfile).T
+                em_wave, em_flux = np.loadtxt(extramfile, unpack=True)
                 ax[crow,ccol].plot(em_wave, em_flux, color='dodgerblue', lw=2.4)
                 ax[crow,ccol].plot(bestmodwave, bestmodflux, color='red',
                     lw=2.4,alpha=1.0)
@@ -1295,7 +1484,7 @@ def lineprofiles(df, spectdct, linedct, savedmoddir,
         # plot another
         if not extra_mod == '':
             if os.path.isfile(extra_mod):
-                em_wave, em_flux = np.genfromtxt(extra_mod).T
+                em_wave, em_flux = np.loadtxt(extra_mod, unpack=True)
                 ax[crow,ccol].plot(em_wave, em_flux, color='blue', lw=2.4)
                 ax[crow,ccol].plot(bestmodwave, bestmodflux, color='orangered',
                     lw=2.4, alpha=1.0)
@@ -1312,21 +1501,210 @@ def lineprofiles(df, spectdct, linedct, savedmoddir,
     else:
         return fig, ax
 
-def correlationplot(the_pdf, df, corrpars):
+def prep_composite_data(spectrum, best_mod_location, plotmoddirlist, compmoddirlist, multiplicity, best_individual, bestfamily, compsdir, active_line):
+    c = 299792.458  # km/s
+    spectrum_name = spectrum.name.split('/')[-1]
+    # Read data per line
+    wave_tmp, flux_tmp, err_tmp = spectrum.get_line_data(active_line)
+
+    # Read profile of best fitting model
+    best_prof_file = best_mod_location + '/combined/profiles/' + active_line + '.prof.comb'
+    bestmodwave, bestmodflux = np.loadtxt(best_prof_file, unpack=True)
+
+    # Read profiles of best fitting family of models
+    lineflux_min = np.copy(bestmodflux)
+    lineflux_max = np.copy(bestmodflux)
+    if len(plotmoddirlist) > 0:
+        for asig_mod in plotmoddirlist:
+            fam_prof_file = asig_mod + active_line + '.prof.comb'
+            smwave, smflux = np.loadtxt(fam_prof_file, unpack=True)
+
+            np.minimum(lineflux_min, smflux, out=lineflux_min)
+            np.maximum(lineflux_max, smflux, out=lineflux_max)
+
+    # Read profiles of individual components of the best model
+    bestmodflux_comps, lineflux_min_comps, lineflux_max_comps = [], [], []
+    best_fluxes = []
+    best_conts = []
+
+    for comp in range(multiplicity):
+        vrad = best_individual.components[comp].parameters[spectrum_name]
+        prof_file = best_mod_location + '/' + str(comp) + '/profiles/' + active_line + '.prof.fin'
+
+        wave, flux, cont = np.loadtxt(prof_file, unpack=True)
+
+        wave_shift = wave * (1.0 + vrad / c)
+
+        flux_i = np.interp(bestmodwave, wave_shift, flux)
+        cont_i = np.interp(bestmodwave, wave_shift, cont)
+
+        best_fluxes.append(flux_i)
+        best_conts.append(cont_i)
+
+    # Compute continuum sum
+    cont_sum = np.sum(best_conts, axis=0)
+
+    for comp in range(multiplicity):
+        vrad = best_individual.components[comp].parameters[spectrum_name]
+        flux = best_fluxes[comp]
+        cont = best_conts[comp]
+
+        scale = cont / cont_sum
+        flux = scale * flux + (1 - scale)
+
+        flux_min = flux.copy()
+        flux_max = flux.copy()
+
+        # Process model family
+        if compmoddirlist:
+            for asig_mod, mod in zip(compmoddirlist, bestfamily):
+                fam_file = asig_mod[comp] + active_line + '.prof.fin'
+
+                smwave, smflux, smcont = np.loadtxt(fam_file, unpack=True)
+
+                smwave = smwave * (1.0 + vrad / c)
+
+                smflux = np.interp(bestmodwave, smwave, smflux)
+                smcont = np.interp(bestmodwave, smwave, smcont)
+
+                scale = smcont / cont_sum
+                smflux = scale * smflux + (1 - scale)
+
+                # Update without temporary arrays
+                np.minimum(flux_min, smflux, out=flux_min)
+                np.maximum(flux_max, smflux, out=flux_max)
+
+        bestmodflux_comps.append(flux)
+        lineflux_min_comps.append(flux_min)
+        lineflux_max_comps.append(flux_max)
+
+        lineprof_arr = np.array([bestmodwave, flux, flux_min,
+                                 flux_max]).T
+        lineprof_arr_head = 'wave bestflux minflux maxflux'
+        np.savetxt(compsdir + str(comp) + '/lineprofs/' + active_line + '.txt', lineprof_arr,
+                   header=lineprof_arr_head)
+
+    return wave_tmp, flux_tmp, err_tmp, bestmodwave, bestmodflux, bestmodflux_comps, lineflux_min, lineflux_max, lineflux_min_comps, lineflux_max_comps
+
+
+def composite_lineprofiles(pool, best_individual: pop.Individual, spectrum: Epoch, savedmoddir,
+    best_mod_location, bestfamily: list[pop.Individual], the_pdf,
+    extra_fwmod, extra_mod, multiplicity, compsdir, save_jpg=False):
+    """
+    Create plot with line profiles of best fitting models.
+    In the background, plot the data.
+    """
+    active_lines = spectrum.get_active_lines()
+    nlines = len(active_lines)
+
+    # Untar best fitting models and their components
+    plotmoddirlist = []
+    compmoddirlist = []
+    for mod in bestfamily:
+        name = mod.name
+        moddir = savedmoddir + name.split('_')[0] + '/' + name.split('_')[1] + '/'
+        plotmoddirlist.append(moddir + 'combined/profiles/')
+        complist = []
+        for index in range(multiplicity):
+            newloc = moddir + str(index) + '/'
+            complist.append(newloc + 'profiles/')
+        compmoddirlist.append(complist)
+
+    # Set up figure dimensions and subplots
+    ncols = 5
+    nrows =int(math.ceil(1.0*nlines/ncols))
+    nrows =max(nrows, 2)
+    ccol = ncols - 1
+    crow = -1
+    figsizefact = 2.5
+    fig, ax = plt.subplots(nrows, ncols,
+        figsize=(figsizefact*ncols, 0.7*figsizefact*nrows))
+
+    prep_data_func = functools.partial(prep_composite_data, spectrum, best_mod_location, plotmoddirlist, compmoddirlist, multiplicity, best_individual, bestfamily, compsdir)
+
+    prep_data = pool.map(prep_data_func, active_lines)
+
+    # Loop through parameters
+    for i in range(ncols*nrows):
+
+        if ccol == ncols - 1:
+            ccol = 0
+            crow = crow + 1
+        else:
+            ccol = ccol + 1
+
+        if i >= nlines:
+            ax[crow,ccol].axis('off')
+            continue
+
+        active_line = active_lines[i]
+        wave_tmp, flux_tmp, err_tmp, bestmodwave, bestmodflux, bestmodflux_comps, lineflux_min, lineflux_max, lineflux_min_comps, lineflux_max_comps = prep_data[i]
+
+        # Make actual plots
+        ax[crow,ccol].set_title(active_line)
+        ax[crow,ccol].axhline(1.0, color='black', lw=0.8)
+        ax[crow,ccol].errorbar(wave_tmp, flux_tmp, yerr=err_tmp,
+            fmt='o', color='black', ms=0)
+        ax[crow,ccol].fill_between(bestmodwave, lineflux_min, lineflux_max,
+            color='#8cd98c', alpha=0.7)
+        ax[crow,ccol].plot(bestmodwave, bestmodflux, color='#1ca641', lw=2.4,
+            alpha=1.0)
+        ax[crow,ccol].set_ylim(np.min([np.min(flux_tmp) * 0.95, np.min(lineflux_min) * 0.95]),
+                           np.max([np.max(flux_tmp) * 1.05, np.max(lineflux_max) * 1.05]))
+
+        colors = ['r', 'b', 'y', 'g']
+        for comp in range(multiplicity):
+            ax[crow, ccol].fill_between(bestmodwave, lineflux_min_comps[comp], lineflux_max_comps[comp],
+                                        color=colors[comp], alpha=0.5)
+            ax[crow, ccol].plot(bestmodwave, bestmodflux_comps[comp], color=colors[comp], lw=2.4,
+                                alpha=1.0)
+
+        # plot an extra fastwind model
+        if not extra_fwmod == '/':
+            extramfile = extra_fwmod + active_lines[i] + '.prof'
+            if os.path.isfile(extramfile):
+                em_wave, em_flux = np.loadtxt(extramfile, unpack=True)
+                ax[crow,ccol].plot(em_wave, em_flux, color='dodgerblue', lw=2.4)
+                ax[crow,ccol].plot(bestmodwave, bestmodflux, color='red',
+                    lw=2.4,alpha=1.0)
+            else:
+                print(extramfile, 'not found')
+                ax[crow,ccol].plot(bestmodwave, bestmodflux, color='orangered',
+                    lw=2.4, alpha=1.0)
+
+        # plot another
+        if not extra_mod == '':
+            if os.path.isfile(extra_mod):
+                em_wave, em_flux = np.loadtxt(extra_mod, unpack=True)
+                ax[crow,ccol].plot(em_wave, em_flux, color='blue', lw=2.4)
+                ax[crow,ccol].plot(bestmodwave, bestmodflux, color='orangered',
+                    lw=2.4, alpha=1.0)
+            else:
+                print(extra_mod, 'not found')
+
+    # Tight layout and save plot
+    plt.tight_layout()
+
+    if not save_jpg:
+        the_pdf.savefig(dpi=150)
+        plt.close()
+        return the_pdf
+    else:
+        return fig, ax
+
+def correlationplot(the_pdf, dfs, corrpars, best_individual):
     """
     Create a correlation plot of the parameters in the list corrpars.
     """
-
-    orig_corrpar = corrpars.copy()
-
-    for par in orig_corrpar:
-        if par not in df.columns:
-            corrpars.remove(par)
-
-    dfs = df.sort_values(by=['invrchi2'])
+    mult = len(dfs)
+    temp_dfs = []
+    for df in dfs:
+        df_sort = df.sort_values(by=['invrchi2'])
+        temp_dfs.append(df_sort)
+    dfs = temp_dfs
 
     # Set up figure dimensions and subplots
-    ncols = len(corrpars)
+    ncols = len(corrpars)*mult
     nrows = ncols
     hratios = 30*np.ones(ncols)
     wratios = 30*np.ones(ncols)
@@ -1347,25 +1725,27 @@ def correlationplot(the_pdf, df, corrpars):
 
     # Loop through parameters to create correlation plot
     pairlist = []
-    for ccol in range(ncols):
-        for crow in range(nrows):
-            pc1 = corrpars[ccol]
-            pc2 = corrpars[crow]
-            pair = [pc1, pc2]
-            if (pc1 == pc2) or (pair in pairlist):
-                ax[crow,ccol].axis('off')
-            else:
-                ax[crow,ccol].scatter(dfs[pc1], dfs[pc2],
-                    c=dfs['invrchi2'],s=10, rasterized=True)
-                pairlist.append(pair)
-                pairlist.append(pair[::-1])
+    for ccol in range(int(ncols/mult)):
+        for crow in range(int(nrows/mult)):
+            for i in range(mult):
+                for j in range(mult):
+                    pc1 = corrpars[ccol]
+                    pc2 = corrpars[crow]
+                    col = ccol*mult + i
+                    row = crow*mult + j
+                    if col >= row:
+                        ax[row,col].axis('off')
+                    else:
+                        ax[row,col].scatter(dfs[i][pc1], dfs[j][pc2],
+                            c=dfs[i]['invrchi2'],s=10, rasterized=True)
 
-            ax[crow,ccol].set_xlim(np.min(dfs[pc1]), np.max(dfs[pc1]))
-            ax[crow,ccol].set_ylim(np.min(dfs[pc2]), np.max(dfs[pc2]))
+                    ax[row,col].set_xlim(np.min(dfs[i][pc1]), np.max(dfs[i][pc1]))
+                    ax[row,col].set_ylim(np.min(dfs[j][pc2]), np.max(dfs[j][pc2]))
     # Label axes
-    for i in range(0, ncols-1):
-        ax[-1,i].set_xlabel(corrpars[i])
-        ax[i+1, 0].set_ylabel(corrpars[i+1])
+    for i in range(0, int(ncols/mult)-1):
+        for comp in range(mult):
+            ax[-1,i*mult + comp].set_xlabel(corrpars[i]+"_"+str(comp))
+            ax[(i+1)*mult + comp, 0].set_ylabel(corrpars[i+1]+"_"+str(comp))
 
     # Tight layout and save plot
     plt.tight_layout()
@@ -1376,13 +1756,75 @@ def correlationplot(the_pdf, df, corrpars):
 
 def get_fwmaxtime(controlfile):
     dct = fw.read_control_pars(controlfile)
-    timeoutstr = dct['fw_timeout']
-    if timeoutstr.endswith('m'):
-        timeout = float(timeoutstr[:-1])*60
-    else:
-        print('Timeout string not given in minutes, exiting')
-        sys.exit()
+    timeout = dct['fw_timeout']
     return timeout
+
+def binary_fw_performance(the_pdf, df, controlfile):
+    """
+        Show maximum interations, convergence and run time of FW models.
+        """
+
+    # Pick up fastwind timeout to assign a number to the runs that ran to max
+    fw_timeout = get_fwmaxtime(controlfile)
+    fw_timeout_min = 1.0 * fw_timeout / 60.0
+    df.loc[(df['cputime_0'] == 99999.9), 'cputime_0'] = fw_timeout
+    df.loc[(df['cputime_1'] == 99999.9), 'cputime_1'] = fw_timeout - df['cputime_0']
+
+    # Only consider models that can generate line profiles
+    df = df[df['chi2'] < 999999999]
+    df = df[df['maxcorr_0'] > 0.0]
+    df = df[df['maxcorr_1'] > 0.0]
+    df['cputime_min_0'] = 1.0 * df['cputime_0'].values / 60.0
+    df['cputime_min_1'] = 1.0 * df['cputime_1'].values / 60.0
+
+    nb = 101
+    bins_maxit = np.linspace(0, 100, nb)
+    bins_maxco = np.linspace(-3, 1.5, nb)
+    bins_ticpu = np.linspace(0, fw_timeout_min, nb)
+
+    for comp in range(2):
+        fig, ax = plt.subplots(2, 3, figsize=(12, 6.5))
+        ax[0, 0].hist(df['maxit'+'_'+str(comp)], bins_maxit,
+                      color='#2b0066', alpha=0.7)
+        ax[0, 1].hist(np.log10(df['maxcorr'+'_'+str(comp)]), bins_maxco,
+                      color='#009c60', alpha=0.7)
+        ax[0, 2].hist(df['cputime_min'+'_'+str(comp)], bins_ticpu,
+                      color='#b5f700', alpha=0.7)
+
+        ax[0, 0].set_xlabel('Maximum iteration component '+str(comp))
+        ax[0, 1].set_xlabel('log(Maximum correction) component '+str(comp))
+        ax[0, 2].set_xlabel('CPU-time (minutes) component '+str(comp))
+        ax[0, 0].set_ylabel('Count')
+        ax[0, 1].set_ylabel('Count')
+        ax[0, 2].set_ylabel('Count')
+
+        sct1 = ax[1, 0].scatter(np.log10(df['maxcorr'+'_'+str(comp)]), df['maxit'+'_'+str(comp)],
+                                s=6, c=df['cputime'+'_'+str(comp)] / 60.0, rasterized=True)
+        ax[1, 0].set_xlabel('log(Maximum correction) component '+str(comp))
+        ax[1, 0].set_ylabel('Maximum iteration component '+str(comp))
+        cbar1 = plt.colorbar(sct1, ax=ax[1, 0])
+        cbar1.ax.set_title(r'CPU-time (min)', fontsize=9)
+
+        sct2 = ax[1, 1].scatter(np.log10(df['maxcorr'+'_'+str(comp)]), df['cputime'+'_'+str(comp)] / 60.0,
+                                s=6, c=df['maxit'+'_'+str(comp)], rasterized=True)
+        ax[1, 1].set_xlabel('log(Maximum correction) component '+str(comp))
+        ax[1, 1].set_ylabel('CPU-time (minutes) component '+str(comp))
+        cbar2 = plt.colorbar(sct2, ax=ax[1, 1])
+        cbar2.ax.set_title(r'Max. iteration', fontsize=9)
+
+        sct3 = ax[1, 2].scatter(df['cputime'+'_'+str(comp)] / 60.0, df['maxit'+'_'+str(comp)],
+                                s=4, c=np.log10(df['maxcorr'+'_'+str(comp)]), rasterized=True)
+        ax[1, 2].set_xlabel('CPU-time (minutes) component '+str(comp))
+        ax[1, 2].set_ylabel('Maximum iteration component '+str(comp))
+        cbar3 = plt.colorbar(sct3, ax=ax[1, 2])
+        cbar3.ax.set_title(r'log(Max. corr.)', fontsize=9)
+
+        # Tight layout and save plot
+        plt.tight_layout()
+        the_pdf.savefig(dpi=150)
+        plt.close()
+
+    return the_pdf
 
 def fw_performance(the_pdf, df, controlfile):
     """
@@ -1397,7 +1839,7 @@ def fw_performance(the_pdf, df, controlfile):
     # Only consider models that can generate line profiles
     df = df[df['chi2'] < 999999999]
     df = df[df['maxcorr'] > 0.0]
-    df['cputime_min'] = 1.0*df['cputime'].values/60.0
+    df['cputime_min'] = 1.0 * df['cputime'].values / 60.0
 
     nb = 101
     bins_maxit = np.linspace(0, 100, nb)
@@ -1447,48 +1889,41 @@ def fw_performance(the_pdf, df, controlfile):
 
     return the_pdf
 
-def convergence(the_pdf, df_orig, dof_tot, npspec, param_names, param_space,
-    deriv_pars, maxgen, runname, fw_path, thecontrolfile,
-    theradiusfile, datapath):
+def convergence(the_pdf, populations: list[pop.Population], npspec,
+    paramspaces: list[pop.Template], deriv_pars, comp=0):
+    mult = len(paramspaces)
 
-    evol_list_best = []
-    evol_list_1sig_up = []
-    evol_list_1sig_down = []
-    evol_list_2sig_up = []
-    evol_list_2sig_down = []
-    for apar in param_names:
-        evol_list_best.append([])
-        evol_list_1sig_up.append([])
-        evol_list_1sig_down.append([])
-        evol_list_2sig_up.append([])
-        evol_list_2sig_down.append([])
-
-    for the_max in range(1,maxgen):
-        df_tmp = df_orig.copy()[df_orig['gen'] < the_max]
-
+    evol_list_best = dict()
+    evol_list_1sig_up = dict()
+    evol_list_1sig_down = dict()
+    evol_list_2sig_up = dict()
+    evol_list_2sig_down = dict()
+    for apar in paramspaces[comp].variables.keys():
+        evol_list_best[apar] = []
+        evol_list_1sig_up[apar] = []
+        evol_list_1sig_down[apar] = []
+        evol_list_2sig_up[apar] = []
+        evol_list_2sig_down[apar] = []
+    best_so_far = populations[0].population[0]
+    for popul in populations:
         # Compute uncertainties
-        df_tmp, best_uncertainty, n1sig, n2sig = get_uncertainties(df_tmp,
-            dof_tot, npspec, param_names, param_space, deriv_pars,
-            incl_deriv=False)
+        best_uncertainty, n1sig, n2sig = get_local_uncertainties(popul, npspec,
+            paramspaces, deriv_pars, best_so_far, incl_deriv=False)
 
         # Unpack all computed values
-        best_model_name, bestfamily_name, params_error_1sig, \
-            params_error_2sig, which_statistic = best_uncertainty
+        best_so_far, bestfamily, params_error_1sig, params_error_2sig, which_statistic = best_uncertainty
+        for par in paramspaces[comp].variables.keys():
+            evol_list_best[par].append(params_error_1sig[comp][par][2])
+            evol_list_1sig_up[par].append(params_error_1sig[comp][par][1])
+            evol_list_1sig_down[par].append(params_error_1sig[comp][par][0])
+            evol_list_2sig_up[par].append(params_error_2sig[comp][par][1])
+            evol_list_2sig_down[par].append(params_error_2sig[comp][par][0])
 
-        for ipar in range(len(param_names)):
-            pname = param_names[ipar]
-            evol_list_best[ipar].append(params_error_1sig[pname][2])
-            evol_list_1sig_up[ipar].append(params_error_1sig[pname][1])
-            evol_list_1sig_down[ipar].append(params_error_1sig[pname][0])
-            evol_list_2sig_up[ipar].append(params_error_2sig[pname][1])
-            evol_list_2sig_down[ipar].append(params_error_2sig[pname][0])
-
-    x_gen = range(len(evol_list_best[0]))
+    gens = range(int(populations[-1].name)-len(populations), int(populations[-1].name))
     # fig, ax = plt.subplots(1, len(param_names))
-
     # Set up figure dimensions and subplots
     ncols = 3
-    nrows =int(math.ceil(1.0*(len(param_names))/ncols))
+    nrows =int(math.ceil(1.0*(len(paramspaces[comp].variables.keys())/ncols)))
     nrows =max(nrows, 2)
     ccol = ncols - 1
     crow = -1
@@ -1507,17 +1942,19 @@ def convergence(the_pdf, df_orig, dof_tot, npspec, param_names, param_space,
         if crow == nrows -1:
             ax[crow,ccol].set_xlabel('Generation')
 
-        if i >= len(param_names):
+        if i >= len(paramspaces[comp].variables.keys()):
             ax[crow,ccol].axis('off')
             continue
 
-        ax[crow,ccol].plot(x_gen, evol_list_best[i], color='red')
-        ax[crow,ccol].fill_between(x_gen, evol_list_1sig_down[i],
-            evol_list_1sig_up[i], color='gold', alpha=0.70)
-        ax[crow,ccol].fill_between(x_gen, evol_list_2sig_down[i],
-            evol_list_2sig_up[i], color='gold', alpha=0.25)
-        ax[crow,ccol].set_ylim(param_space[i][0], param_space[i][1])
-        ax[crow,ccol].set_ylabel(param_names[i])
+        param = list(paramspaces[comp].variables.keys())[i]
+
+        ax[crow,ccol].plot(gens, evol_list_best[param], color='red')
+        ax[crow,ccol].fill_between(gens, evol_list_1sig_down[param],
+            evol_list_1sig_up[param], color='gold', alpha=0.70)
+        ax[crow,ccol].fill_between(gens, evol_list_2sig_down[param],
+            evol_list_2sig_up[param], color='gold', alpha=0.25)
+        ax[crow,ccol].set_ylim(float(paramspaces[comp].variables[param][0]), float(paramspaces[comp].variables[param][1]))
+        ax[crow,ccol].set_ylabel(param)
 
     plt.tight_layout()
     the_pdf.savefig(dpi=150)
@@ -1525,27 +1962,27 @@ def convergence(the_pdf, df_orig, dof_tot, npspec, param_names, param_space,
 
     return the_pdf
 
-def save_bestvals(param_names, deriv_pars, params_error_1sig, params_error_2sig,
+def save_bestvals(best_model_comp: pop.Component, deriv_pars, params_error_1sig, params_error_2sig,
     deriv_params_error_1sig, deriv_params_error_2sig, savebest_txt):
     """
     Save best fit parameters and errors to text file
     """
 
     if os.path.isfile(savebest_txt):
-        os.system('rm ' + savebest_txt)
+        os.remove(savebest_txt)
 
     write_lines = []
     rv = 4
     lj = 10
     lj0 = 15
-    for apar in param_names:
+    for apar in list(best_model_comp.template.variables.keys()):
         bestfit = params_error_2sig[apar][2]
         low1sig = str(round(bestfit - params_error_1sig[apar][0], rv))
         up1sig = str(round(params_error_1sig[apar][1] - bestfit, rv))
         low2sig = str(round(bestfit - params_error_2sig[apar][0], rv))
         up2sig = str(round(params_error_2sig[apar][1] - bestfit, rv))
         bestfit = str(round(bestfit,rv))
-        savestr = (apar.ljust(lj0) + ' ' + bestfit.ljust(lj) + ' '
+        savestr = ((apar).ljust(lj0) + ' ' + bestfit.ljust(lj) + ' '
             + low1sig.ljust(lj) + ' ' + up1sig.ljust(lj) + ' '
             + low2sig.ljust(lj) + ' ' + up2sig.ljust(lj))
         write_lines.append(savestr)
@@ -1557,7 +1994,7 @@ def save_bestvals(param_names, deriv_pars, params_error_1sig, params_error_2sig,
         low2sig = str(round(bestfit - deriv_params_error_2sig[apar][0], rv))
         up2sig = str(round(deriv_params_error_2sig[apar][1] - bestfit, rv))
         bestfit = str(round(bestfit,rv))
-        savestr = (apar.ljust(lj0) + ' ' + bestfit.ljust(lj) + ' '
+        savestr = ((apar).ljust(lj0) + ' ' + bestfit.ljust(lj) + ' '
             + low1sig.ljust(lj) + ' ' + up1sig.ljust(lj) + ' '
             + low2sig.ljust(lj) + ' ' + up2sig.ljust(lj))
         write_lines.append(savestr)
@@ -1570,20 +2007,6 @@ def save_bestvals(param_names, deriv_pars, params_error_1sig, params_error_2sig,
             myfile.write(aline)
             myfile.write('\n')
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#
+def save_parameters(param_df, component_directory):
+    for i in range(len(param_df)):
+        param_df[i].to_csv(component_directory + str(i) + '/parameters.csv', index=False)
